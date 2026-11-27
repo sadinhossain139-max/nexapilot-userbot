@@ -1021,6 +1021,167 @@ class SupabaseStore:
         )
         return bool(r1.data or r2.data)
 
+    # -- monetization, referrals & payment_requests --
+
+    async def update_bot_user(
+        self, owner_user_id: int, updates: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        payload = {**updates, "updated_at": datetime.now(timezone.utc).isoformat()}
+        res = await self._run(
+            lambda: self._client.table("bot_users")
+            .update(payload)
+            .eq("owner_user_id", owner_user_id)
+            .execute()
+        )
+        return res.data[0] if res.data else await self.get_bot_user(owner_user_id)
+
+    async def get_account_owner_id(self, telegram_user_id: int) -> int | None:
+        """Resolve which bot owner_user_id owns a connected userbot telegram_user_id."""
+        r1 = await self._run(
+            lambda: self._client.table("user_sessions")
+            .select("owner_user_id")
+            .eq("telegram_user_id", telegram_user_id)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        if r1.data and r1.data[0].get("owner_user_id") is not None:
+            return int(r1.data[0]["owner_user_id"])
+
+        r2 = await self._run(
+            lambda: self._client.table("manual_sessions")
+            .select("owner_user_id")
+            .eq("telegram_user_id", telegram_user_id)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        if r2.data and r2.data[0].get("owner_user_id") is not None:
+            return int(r2.data[0]["owner_user_id"])
+        return None
+
+    async def record_pending_referral(
+        self, referrer_id: int, referred_user_id: int
+    ) -> bool:
+        """Record a pending referral if not self-referral and user has not been referred yet."""
+        if referrer_id == referred_user_id:
+            return False
+        referrer = await self.get_bot_user(referrer_id)
+        if not referrer:
+            return False
+        try:
+            existing = await self._run(
+                lambda: self._client.table("referrals")
+                .select("id")
+                .eq("referred_user_id", referred_user_id)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                return False
+            await self._run(
+                lambda: self._client.table("referrals")
+                .insert(
+                    {
+                        "referrer_id": referrer_id,
+                        "referred_user_id": referred_user_id,
+                        "status": "pending",
+                    }
+                )
+                .execute()
+            )
+            await self.update_bot_user(referred_user_id, {"referred_by": referrer_id})
+            return True
+        except Exception as exc:
+            logger.debug("record_pending_referral skipped: %s", exc)
+            return False
+
+    async def verify_referral_and_increment(self, referred_user_id: int) -> int | None:
+        """
+        Mark a pending referral as 'verified' (idempotent) and increment referrer's referral_count.
+        Returns referrer_id if newly verified, else None.
+        """
+        res = await self._run(
+            lambda: self._client.table("referrals")
+            .select("id,referrer_id,status")
+            .eq("referred_user_id", referred_user_id)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return None
+        row = res.data[0]
+        ref_id = int(row["referrer_id"])
+        upd = await self._run(
+            lambda: self._client.table("referrals")
+            .update({"status": "verified"})
+            .eq("id", row["id"])
+            .eq("status", "pending")
+            .execute()
+        )
+        if not upd.data:
+            return None
+
+        ref_user = await self.get_bot_user(ref_id)
+        new_count = int((ref_user or {}).get("referral_count") or 0) + 1
+        await self.update_bot_user(ref_id, {"referral_count": new_count})
+        return ref_id
+
+    async def create_payment_request(
+        self,
+        user_id: int,
+        plan_type: str,
+        duration_days: int,
+        payment_method: str,
+        amount_display: str,
+        trx_id: str,
+        proof_file_id: str | None = None,
+    ) -> dict[str, Any]:
+        for _ in range(5):
+            pay_id = f"PAY-{uuid.uuid4().hex[:6].upper()}"
+            existing = await self.get_payment_request(pay_id)
+            if existing is None:
+                row: dict[str, Any] = {
+                    "id": pay_id,
+                    "user_id": user_id,
+                    "plan_type": plan_type,
+                    "duration_days": int(duration_days),
+                    "payment_method": payment_method,
+                    "amount_display": amount_display,
+                    "trx_id": trx_id.strip(),
+                    "proof_file_id": proof_file_id,
+                    "status": "pending",
+                }
+                res = await self._run(
+                    lambda r=row: self._client.table("payment_requests").insert(r).execute()
+                )
+                return res.data[0] if res.data else row
+        raise RuntimeError("Failed to generate unique payment request ID")
+
+    async def get_payment_request(self, pay_id: str) -> dict[str, Any] | None:
+        norm_id = pay_id.strip().upper()
+        res = await self._run(
+            lambda: self._client.table("payment_requests")
+            .select("*")
+            .eq("id", norm_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
+    async def update_payment_request(
+        self, pay_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        norm_id = pay_id.strip().upper()
+        res = await self._run(
+            lambda: self._client.table("payment_requests")
+            .update(updates)
+            .eq("id", norm_id)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
 
 # ---------------------------------------------------------------------------
 # Pyrogram / Kurigram In-Memory Userbot Manager
@@ -1037,17 +1198,21 @@ class UserbotManager:
         api_id: int,
         api_hash: str,
         tz: ZoneInfo,
+        cache: Any = None,
     ) -> None:
         self.db = db
         self.scheduler = scheduler
         self.api_id = api_id
         self.api_hash = api_hash
         self.tz = tz
+        self.cache = cache
 
         # Active userbot registry: telegram_user_id -> Client
         self.active_clients: dict[int, Client] = {}
         # Source & account metadata: telegram_user_id -> {source, label, username, manual_session_id}
         self.session_metadata: dict[int, dict[str, Any]] = {}
+        # Owner resolution cache: telegram_user_id -> owner_user_id (or None if legacy unowned)
+        self._owner_id_cache: dict[int, int | None] = {}
 
         # Per-user in-memory caches for low-latency message handling
         self._mention_cache: dict[int, tuple[bool, str | None]] = {}
@@ -1071,6 +1236,31 @@ class UserbotManager:
         self._campaign_wizards: dict[int, dict[str, Any]] = {}
         # Per-account send lock so multiple simultaneous campaigns pace safely
         self._account_send_locks: dict[int, asyncio.Lock] = {}
+
+    async def _check_account_entitlement(
+        self, telegram_user_id: int, feature: str | None = None
+    ) -> bool:
+        """
+        Strict backend plan/expiry guard for Kurigram workers (campaigns, schedules, auto-replies).
+        Uses Redis-cached entitlement checks (TTL 60s) via entitlements.is_user_plan_active.
+        """
+        if telegram_user_id not in self._owner_id_cache:
+            try:
+                self._owner_id_cache[telegram_user_id] = await self.db.get_account_owner_id(
+                    telegram_user_id
+                )
+            except Exception:
+                return True
+        owner_id = self._owner_id_cache.get(telegram_user_id)
+        if owner_id is None:
+            return True
+        try:
+            from entitlements import is_user_plan_active
+
+            return await is_user_plan_active(self.db, self.cache, owner_id, feature=feature)
+        except Exception as exc:
+            logger.warning("Entitlement check failed for owner=%s: %s", owner_id, exc)
+            return True
 
     # -- Lifecycle --
 
@@ -1678,6 +1868,14 @@ class UserbotManager:
             )
             return
 
+        if not await self._check_account_entitlement(telegram_user_id, feature="schedules"):
+            logger.info(
+                "Blocked scheduled job %s for user=%s: plan expired or schedules locked.",
+                job_id,
+                telegram_user_id,
+            )
+            return
+
         template = await self._get_template_cached(telegram_user_id, template_id)
         if not template:
             logger.warning(
@@ -1841,6 +2039,9 @@ class UserbotManager:
             )
             return
 
+        if not await self._check_account_entitlement(telegram_user_id, feature="auto_replies"):
+            return
+
         key = (telegram_user_id, message.chat.id)
         now = time.monotonic()
         last_sent = self._mention_cooldowns.get(key)
@@ -1886,6 +2087,9 @@ class UserbotManager:
 
         sender_id = self._is_valid_dm_sender(message, telegram_user_id)
         if sender_id is None:
+            return
+
+        if not await self._check_account_entitlement(telegram_user_id, feature="auto_replies"):
             return
 
         msg_key = (telegram_user_id, message.chat.id, message.id)
@@ -1959,6 +2163,9 @@ class UserbotManager:
         if not rules:
             return
 
+        if not await self._check_account_entitlement(telegram_user_id, feature="auto_replies"):
+            return
+
         incoming_lower = message.text.lower()
         now = time.monotonic()
 
@@ -2015,6 +2222,9 @@ class UserbotManager:
 
         sender_id = self._is_valid_dm_sender(message, telegram_user_id)
         if sender_id is None:
+            return
+
+        if not await self._check_account_entitlement(telegram_user_id, feature="auto_replies"):
             return
 
         msg_key = (telegram_user_id, message.chat.id, message.id)
@@ -3290,6 +3500,17 @@ class UserbotManager:
                 if not cmp or cmp.get("status") != "running":
                     return
 
+                if not await self._check_account_entitlement(telegram_user_id, feature="campaigns"):
+                    logger.info(
+                        "[CAMPAIGN] Stopping %s for user=%s: plan expired.",
+                        campaign_id,
+                        telegram_user_id,
+                    )
+                    await self.db.update_campaign(
+                        campaign_id, {"status": "paused"}, telegram_user_id
+                    )
+                    return
+
                 template = await self._get_template_cached(
                     telegram_user_id, cmp.get("template_id")
                 )
@@ -3330,9 +3551,19 @@ class UserbotManager:
                 total_failed = int(cmp.get("total_failed", 0))
 
                 for idx, grp in enumerate(groups):
-                    # Re-check DB status so pause/block takes effect immediately
+                    # Re-check DB status and plan expiry before every single message
                     latest = await self.db.get_campaign(campaign_id, telegram_user_id)
                     if not latest or latest.get("status") != "running":
+                        return
+                    if not await self._check_account_entitlement(telegram_user_id, feature="campaigns"):
+                        logger.info(
+                            "[CAMPAIGN] Mid-round hard-stop %s for user=%s: plan expired.",
+                            campaign_id,
+                            telegram_user_id,
+                        )
+                        await self.db.update_campaign(
+                            campaign_id, {"status": "paused"}, telegram_user_id
+                        )
                         return
 
                     chat_id = int(grp["chat_id"])

@@ -45,6 +45,19 @@ from pyrogram.errors import (
     SessionPasswordNeeded,
 )
 
+from urllib.parse import quote
+
+from config import (
+    ADMIN_USER_IDS,
+    FREE_TRIAL_DAYS,
+    REFERRAL_REWARD_DAYS,
+    REFERRAL_REWARD_PLAN,
+    REFERRALS_REQUIRED,
+    get_configured_payment_methods,
+    get_force_join_info,
+    get_payment_method,
+    get_plan_config,
+)
 from emojis import (
     BUTTON_CUSTOM_EMOJI_SUPPORTED,
     BUTTON_STYLE_SUPPORTED,
@@ -54,6 +67,13 @@ from emojis import (
     render_ui_message,
     serialize_bot_entities,
     utf16_len,
+)
+from entitlements import (
+    build_progress_bar,
+    claim_free_trial,
+    get_user_entitlement,
+    grant_or_extend_plan,
+    process_referral_milestone,
 )
 from redis_cache import RedisCache
 from userbot import (
@@ -112,6 +132,7 @@ class NexaPilotBot:
 
         # Per-owner temporary Kurigram login client: owner_user_id -> dict
         self._pending_logins: dict[int, dict[str, Any]] = {}
+        self.bot_username: str = ""
         self.is_running: bool = False
 
     async def start(self) -> None:
@@ -135,7 +156,7 @@ class NexaPilotBot:
             BotMessageHandler(
                 _on_text,
                 bot_filters.private
-                & bot_filters.text
+                & (bot_filters.text | bot_filters.photo)
                 & ~bot_filters.command(["start", "menu", "help"]),
             ),
             group=1,
@@ -145,6 +166,7 @@ class NexaPilotBot:
         await self.client.start()
         self.is_running = True
         me = await self.client.get_me()
+        self.bot_username = str(getattr(me, "username", "") or "")
         logger.info(
             "NexaPilot ftmgram Bot started as @%s (id=%s, button_emoji=%s, button_style=%s, redis=%s)",
             me.username,
@@ -421,20 +443,53 @@ class NexaPilotBot:
 
     # -- Keyboards (Colored Buttons + Premium Custom Emoji Icons) --
 
-    def _main_menu_kb(self) -> InlineKeyboardMarkup:
+    def _main_menu_kb(self, ent: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+        can_auto = bool(ent.get("can_use_auto_replies")) if ent else True
+        can_sched = bool(ent.get("can_use_schedules")) if ent else True
+        is_active = bool(ent.get("is_active")) if ent else True
+
+        auto_btn = make_button(
+            "Auto-Replies" if can_auto else "Auto-Replies (Ultra)",
+            "np:auto",
+            "auto_replies" if can_auto else "locked",
+            style="primary",
+        )
+        sched_btn = make_button(
+            "Schedules" if can_sched else "Schedules (Pro)",
+            "np:sched",
+            "schedules" if can_sched else "locked",
+            style="primary",
+        )
+        tpl_btn = make_button(
+            "Templates",
+            "np:tpl",
+            "templates" if is_active else "locked",
+            style="primary",
+        )
+        cmp_btn = make_button(
+            "Campaigns",
+            "np:cmp",
+            "campaigns" if is_active else "locked",
+            style="primary",
+        )
+
         return InlineKeyboardMarkup(
             [
                 [
                     make_button("My Account", "np:acc", "my_account", style="primary"),
-                    make_button("Templates", "np:tpl", "templates", style="primary"),
+                    tpl_btn,
                 ],
                 [
-                    make_button("Campaigns", "np:cmp", "campaigns", style="primary"),
-                    make_button("Auto-Replies", "np:auto", "auto_replies", style="primary"),
+                    cmp_btn,
+                    auto_btn,
                 ],
                 [
-                    make_button("Schedules", "np:sched", "schedules", style="primary"),
+                    sched_btn,
                     make_button("Status & Health", "np:status", "status_health", style="primary"),
+                ],
+                [
+                    make_button("Upgrade / Plans", "np:plans", "upgrade", style="success"),
+                    make_button("Refer & Earn", "np:ref", "referral", style="primary"),
                 ],
                 [
                     make_button("Refresh Dashboard", "np:home:refresh", "refresh", style="primary"),
@@ -447,6 +502,147 @@ class NexaPilotBot:
             [[make_button("Cancel", f"np:cancel:{back}", "cancel", style="danger")]]
         )
 
+    # -- Force-Join, Trial & Feature Gate Helpers --
+
+    async def _is_channel_member(self, user_id: int) -> bool:
+        chat_ref, _ = get_force_join_info()
+        if not chat_ref:
+            return True
+        try:
+            member = await self.client.get_chat_member(chat_ref, user_id)
+            status_name = str(getattr(getattr(member, "status", None), "name", "")).upper()
+            return status_name in ("OWNER", "CREATOR", "ADMINISTRATOR", "MEMBER", "RESTRICTED")
+        except Exception as exc:
+            logger.debug("Channel membership check failed for user=%s (%s): %s", user_id, chat_ref, exc)
+            return False
+
+    def _build_force_join_screen(self, first_name: str | None = None) -> tuple[RichText, InlineKeyboardMarkup]:
+        chat_ref, join_url = get_force_join_info()
+        r = RichText()
+        r.line("Welcome to NexaPilot!", icon="brand")
+        r.line("========================")
+        if first_name:
+            r.line(f"Hello, {first_name}!", icon="spark")
+        r.line(f"To unlock NexaPilot, please join our official channel first: {chat_ref}", icon="channel")
+        r.line("After joining, tap 'Verify Membership' below to continue.", icon="ok")
+        kb = InlineKeyboardMarkup(
+            [
+                [make_button("Join Channel", url=join_url, emoji_key="join_channel", style="primary")],
+                [make_button("Verify Membership", "np:verify_join", "verify_join", style="success")],
+            ]
+        )
+        return r, kb
+
+    def _build_claim_trial_screen(self, first_name: str | None = None) -> tuple[RichText, InlineKeyboardMarkup]:
+        trial_cfg = get_plan_config("trial")
+        r = RichText()
+        r.line(f"Claim Your {FREE_TRIAL_DAYS}-Day Free Trial", icon="trial")
+        r.line("================================")
+        if first_name:
+            r.line(f"Welcome aboard, {first_name}!", icon="spark")
+        r.line("Starter Access (Non-Premium Trial) includes:", icon="ok")
+        r.line(f"• {trial_cfg['max_accounts']} Connected Account")
+        r.line(f"• Up to {trial_cfg['max_templates']} Templates & {trial_cfg['max_campaigns']} Campaign")
+        r.line("Locked during Free Trial:", icon="lock")
+        r.line("• Scheduled Posts (Requires Premium / Ultra)")
+        r.line("• Auto-Replies Suite (Requires Ultra Premium)")
+        r.line("")
+        r.line("Tap below to activate your free starter trial now!", icon="fire")
+        kb = InlineKeyboardMarkup(
+            [
+                [make_button(f"Claim {FREE_TRIAL_DAYS}-Day Free Trial", "np:trial:claim", "claim_trial", style="success")],
+                [make_button("View Premium Plans", "np:plans", "upgrade", style="primary")],
+            ]
+        )
+        return r, kb
+
+    async def _require_feature(
+        self,
+        cq: CallbackQuery,
+        owner_id: int,
+        feature: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Gate bot UI features strictly by active subscription tier."""
+        ent = await get_user_entitlement(self.db, self.cache, owner_id)
+        if not ent["is_active"]:
+            r = RichText()
+            r.line("Plan Expired / Inactive", icon="expired")
+            r.line("========================")
+            r.line("Your NexaPilot plan is currently expired or inactive.", icon="warn")
+            r.line("All campaigns, schedules, and auto-replies are paused until you renew.")
+            r.line("Upgrade now or invite friends to earn free Premium days!", icon="gift")
+            kb = InlineKeyboardMarkup(
+                [
+                    [make_button("Upgrade / Renew Now", "np:plans", "upgrade", style="success")],
+                    [make_button("Refer & Earn Free Days", "np:ref", "referral", style="primary")],
+                    [make_button("Main Menu", "np:home", "home", style="primary")],
+                ]
+            )
+            await self.edit_ui(cq, r, kb)
+            return None
+
+        if feature == "schedules" and not ent["can_use_schedules"]:
+            r = RichText()
+            r.line("Premium Required — Scheduled Posts", icon="premium")
+            r.line("===================================")
+            r.line(f"Current Plan: {ent['plan_name']}", icon="timer")
+            r.line("Scheduled Posts (one-time & recurring) unlock on Premium and Ultra Premium plans.", icon="lock")
+            kb = InlineKeyboardMarkup(
+                [
+                    [make_button("Upgrade Now", "np:plans", "upgrade", style="success")],
+                    [make_button("Refer & Earn Free Days", "np:ref", "referral", style="primary")],
+                    [make_button("Main Menu", "np:home", "home", style="primary")],
+                ]
+            )
+            await self.edit_ui(cq, r, kb)
+            return None
+
+        if feature == "auto_replies" and not ent["can_use_auto_replies"]:
+            r = RichText()
+            r.line("Ultra Premium Required — Auto-Replies", icon="ultra")
+            r.line("======================================")
+            r.line(f"Current Plan: {ent['plan_name']}", icon="timer")
+            r.line("The full Auto-Replies suite (Mention, Welcome DM, Offline/Away, Keyword Replies) is exclusive to Ultra Premium.", icon="lock")
+            kb = InlineKeyboardMarkup(
+                [
+                    [make_button("Upgrade to Ultra", "np:plans", "ultra", style="success")],
+                    [make_button("Main Menu", "np:home", "home", style="primary")],
+                ]
+            )
+            await self.edit_ui(cq, r, kb)
+            return None
+
+        return ent
+
+    async def _finalize_verified_referral(self, referred_user_id: int) -> None:
+        """Credit pending referrer once referred user passes channel verification."""
+        referrer_id = await self.db.verify_referral_and_increment(referred_user_id)
+        if not referrer_id:
+            return
+        reward_granted, new_count, new_ent = await process_referral_milestone(
+            self.db, self.cache, referrer_id
+        )
+        try:
+            r = RichText()
+            if reward_granted and new_ent:
+                r.line("Referral Reward Unlocked!", icon="gift")
+                r.line(
+                    f"You reached {new_count} verified referrals and earned +{REFERRAL_REWARD_DAYS} Days of {REFERRAL_REWARD_PLAN.title()}!",
+                    icon="ok",
+                )
+                r.line(f"New Time Left: {new_ent['remaining_text']}", icon="timer")
+            else:
+                r.line("New Verified Referral!", icon="referral")
+                r.line(f"Someone joined via your link! Progress: {build_progress_bar(new_count, REFERRALS_REQUIRED)}")
+                r.line(f"Reach {REFERRALS_REQUIRED} referrals to unlock +{REFERRAL_REWARD_DAYS} Days {REFERRAL_REWARD_PLAN.title()}!", icon="gift")
+            await self.send_ui(
+                referrer_id,
+                r,
+                InlineKeyboardMarkup([[make_button("Refer & Earn", "np:ref", "referral", style="primary")]]),
+            )
+        except Exception as exc:
+            logger.debug("Could not notify referrer %s: %s", referrer_id, exc)
+
     # -- Dashboard Rendering (Redis-Cached) --
 
     async def _build_dashboard(
@@ -455,11 +651,11 @@ class NexaPilotBot:
         if force_refresh:
             await self.cache.invalidate_user_cache(owner_user_id)
 
+        ent = await get_user_entitlement(self.db, self.cache, owner_user_id, force_fresh=force_refresh)
         dash = None if force_refresh else await self.cache.get_user_cache(owner_user_id, "dashboard")
         if not isinstance(dash, dict):
-            bot_user, accounts = await self._get_owner_profile(owner_user_id)
+            _, accounts = await self._get_owner_profile(owner_user_id)
             acc = accounts[0] if accounts else None
-            max_acc = int(bot_user.get("max_accounts", 1))
             if acc:
                 uid = int(acc["telegram_user_id"])
                 live = uid in self.manager.active_clients
@@ -476,7 +672,6 @@ class NexaPilotBot:
                     "username": acc.get("username"),
                     "live": live,
                     "slots_used": len(accounts),
-                    "max_accounts": max_acc,
                     "running_campaigns": running_cmps,
                     "templates_count": len(tpls),
                     "schedules_count": len(scheds),
@@ -485,9 +680,15 @@ class NexaPilotBot:
                 dash = {
                     "connected": False,
                     "slots_used": 0,
-                    "max_accounts": max_acc,
                 }
             await self.cache.set_user_cache(owner_user_id, "dashboard", dash)
+
+        plan_icon = {
+            "trial": "trial",
+            "premium": "premium",
+            "ultra": "ultra",
+            "expired": "expired",
+        }.get(ent["effective_plan"], "warn")
 
         r = RichText()
         r.line("NexaPilot Control Panel", icon="brand")
@@ -495,6 +696,10 @@ class NexaPilotBot:
         if first_name:
             r.line(f"Welcome, {first_name}!", icon="spark")
 
+        r.line(f"Plan: {ent['plan_name']}", icon=plan_icon)
+        r.line(f"Time Left: {ent['remaining_text']}", icon="timer")
+
+        max_acc = ent["max_accounts"]
         if dash.get("connected"):
             uid = int(dash["uid"])
             live = uid in self.manager.active_clients
@@ -504,32 +709,66 @@ class NexaPilotBot:
                 icon="connected" if live else "disconnected",
             )
             r.line(
-                f"Slots: {dash['slots_used']}/{dash['max_accounts']} | Running Campaigns: {dash.get('running_campaigns', 0)}",
+                f"Slots: {dash['slots_used']}/{max_acc} | Active Campaigns: {dash.get('running_campaigns', 0)}",
                 icon="stat",
             )
             r.line(
-                f"Templates: {dash.get('templates_count', 0)} | Schedules: {dash.get('schedules_count', 0)}",
+                f"Templates: {dash.get('templates_count', 0)}/{ent['max_templates']} | Schedules: {dash.get('schedules_count', 0)}",
                 icon="tpl",
             )
         else:
             r.line(
-                f"Account: Not Connected (0/{dash.get('max_accounts', 1)})",
+                f"Account: Not Connected (0/{max_acc})",
                 icon="disconnected",
             )
-            r.line("Tap 'My Account' below to connect your Telegram account.")
 
         r.line("")
-        r.line("Manage everything directly here — no Saved Messages needed.", icon="fire")
-        return r, self._main_menu_kb()
+        if not ent["is_active"]:
+            r.line("Your plan is expired. Upgrade or refer friends to resume automation!", icon="expired")
+        else:
+            r.line("Manage everything directly here — no Saved Messages needed.", icon="fire")
+        return r, self._main_menu_kb(ent)
 
-    # -- /start Handler --
+    # -- /start Handler (Force-Join + Referral Deep Link + Claimable 7-Day Trial) --
 
     async def _handle_start(self, _client: BotClient, message: BotMessage) -> None:
         if not message.from_user:
             return
         owner_id = int(message.from_user.id)
         await self.cache.clear_fsm(owner_id)
+
+        existing_user = await self.db.get_bot_user(owner_id)
+        is_new_user = existing_user is None
         await self._ensure_bot_user(message.from_user)
+
+        # Parse /start ref_<id> deep link for new users
+        parts = (message.text or "").split(maxsplit=1)
+        if is_new_user and len(parts) > 1 and parts[1].strip().startswith("ref_"):
+            ref_raw = parts[1].strip()[4:]
+            if ref_raw.isdigit():
+                await self.db.record_pending_referral(int(ref_raw), owner_id)
+
+        # 1. Force-Join Channel Verification
+        if not await self._is_channel_member(owner_id):
+            r, kb = self._build_force_join_screen(message.from_user.first_name)
+            await self.send_ui(message.chat.id, r, kb)
+            return
+
+        # User is in channel: mark verified & credit any pending referral
+        ent = await get_user_entitlement(self.db, self.cache, owner_id, force_fresh=True)
+        if not ent["channel_verified"]:
+            await self.db.update_bot_user(owner_id, {"channel_verified": True})
+            await self.cache.invalidate_user_cache(owner_id, ("entitlement", "profile", "dashboard"))
+            await self._finalize_verified_referral(owner_id)
+            ent = await get_user_entitlement(self.db, self.cache, owner_id, force_fresh=True)
+
+        # 2. Claimable 7-Day Free Trial Screen for eligible new users
+        if not ent["trial_claimed"] and ent["raw_plan"] == "none":
+            r, kb = self._build_claim_trial_screen(message.from_user.first_name)
+            await self.send_ui(message.chat.id, r, kb)
+            return
+
+        # 3. Open Main Dashboard
         r, kb = await self._build_dashboard(owner_id, message.from_user.first_name)
         await self.send_ui(message.chat.id, r, kb)
 
@@ -542,16 +781,74 @@ class NexaPilotBot:
         await self._ensure_bot_user(cq.from_user)
         data = cq.data
 
+        # Handle verify_join BEFORE generic cq.answer() so we can show popup alert if not joined
+        if data == "np:verify_join":
+            if not await self._is_channel_member(owner_id):
+                try:
+                    await cq.answer("Please join the channel first, then tap Verify!", show_alert=True)
+                except Exception:
+                    pass
+                return
+            try:
+                await cq.answer("Membership verified!", show_alert=False)
+            except Exception:
+                pass
+            await self.db.update_bot_user(owner_id, {"channel_verified": True})
+            await self.cache.invalidate_user_cache(owner_id, ("entitlement", "profile", "dashboard"))
+            await self._finalize_verified_referral(owner_id)
+            ent = await get_user_entitlement(self.db, self.cache, owner_id, force_fresh=True)
+            if not ent["trial_claimed"] and ent["raw_plan"] == "none":
+                r, kb = self._build_claim_trial_screen(cq.from_user.first_name)
+                await self.edit_ui(cq, r, kb)
+            else:
+                r, kb = await self._build_dashboard(owner_id, cq.from_user.first_name, force_refresh=True)
+                await self.edit_ui(cq, r, kb)
+            return
+
         try:
             await cq.answer()
         except Exception:
             pass
 
         try:
+            # Admin payment approval callbacks (restricted strictly to ADMIN_USER_IDS)
+            if data.startswith("np:admin:approve:"):
+                await self._handle_admin_payment_decision(cq, owner_id, data.split(":")[-1], approve=True)
+                return
+            if data.startswith("np:admin:reject:"):
+                await self._handle_admin_payment_decision(cq, owner_id, data.split(":")[-1], approve=False)
+                return
+
             if data.startswith("np:cancel:"):
                 await self.cache.clear_fsm(owner_id)
                 await self._cleanup_login(owner_id)
                 data = data.split("np:cancel:", 1)[1] or "np:home"
+
+            # ---- Trial Claim ----
+            if data == "np:trial:claim":
+                claimed, ent = await claim_free_trial(self.db, self.cache, owner_id)
+                r, kb = await self._build_dashboard(owner_id, cq.from_user.first_name, force_refresh=True)
+                await self.edit_ui(cq, r, kb)
+                return
+
+            # ---- Monetization, Plans, Referrals & Payments (Always Accessible) ----
+            if data == "np:plans":
+                await self._view_plans_menu(cq, owner_id)
+                return
+            if data == "np:ref":
+                await self._view_referral_menu(cq, owner_id)
+                return
+            if data.startswith("np:pay:plan:"):
+                await self._view_payment_methods(cq, owner_id, data.split(":")[-1])
+                return
+            if data.startswith("np:pay:method:"):
+                _, _, _, plan_key, method_key = data.split(":", 4)
+                await self._view_payment_instructions(cq, owner_id, plan_key, method_key)
+                return
+            if data.startswith("np:pay:submit:"):
+                _, _, _, plan_key, method_key = data.split(":", 4)
+                await self._start_payment_proof_step(cq, owner_id, plan_key, method_key)
+                return
 
             if data == "np:home":
                 await self.cache.clear_fsm(owner_id)
@@ -571,10 +868,14 @@ class NexaPilotBot:
             if data == "np:acc":
                 await self._view_account_menu(cq, owner_id)
             elif data == "np:acc:otp":
+                if not await self._require_feature(cq, owner_id):
+                    return
                 await self._start_otp_login(cq, owner_id)
             elif data == "np:acc:resend":
                 await self._resend_otp_login(cq, owner_id)
             elif data == "np:acc:str":
+                if not await self._require_feature(cq, owner_id):
+                    return
                 await self._start_session_string_login(cq, owner_id)
             elif data == "np:acc:ping":
                 await self._run_account_ping(cq, owner_id)
@@ -587,12 +888,31 @@ class NexaPilotBot:
             elif data == "np:status":
                 await self._view_status(cq, owner_id)
 
-            # ---- Templates Section ----
+            # ---- Templates Section (Active Plan Required) ----
             elif data == "np:tpl":
+                if not await self._require_feature(cq, owner_id, "templates"):
+                    return
                 await self._view_templates_menu(cq, owner_id)
             elif data == "np:tpl:new":
+                ent = await self._require_feature(cq, owner_id, "templates")
+                if not ent:
+                    return
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
+                    return
+                existing_tpls = await self._get_cached_templates(owner_id, int(acc["telegram_user_id"]))
+                if len(existing_tpls) >= int(ent["max_templates"]):
+                    r = RichText()
+                    r.line("Template Limit Reached", icon="lock")
+                    r.line(f"Your {ent['plan_name']} plan allows up to {ent['max_templates']} template(s).")
+                    r.line("Upgrade your plan to unlock more templates!")
+                    kb = InlineKeyboardMarkup(
+                        [
+                            [make_button("Upgrade Plan", "np:plans", "upgrade", style="success")],
+                            [make_button("Back", "np:tpl", "back", style="primary")],
+                        ]
+                    )
+                    await self.edit_ui(cq, r, kb)
                     return
                 await self.cache.set_fsm(owner_id, {"flow": "tpl_new"})
                 r = RichText()
@@ -607,23 +927,35 @@ class NexaPilotBot:
             elif data.startswith("np:tpl:del:"):
                 await self._confirm_delete_template(cq, owner_id, data.split(":")[-1])
 
-            # ---- Campaigns Section ----
+            # ---- Campaigns Section (Active Plan Required) ----
             elif data == "np:cmp":
+                if not await self._require_feature(cq, owner_id, "campaigns"):
+                    return
                 await self._view_campaigns_menu(cq, owner_id)
             elif data == "np:cmp:refresh":
+                if not await self._require_feature(cq, owner_id, "campaigns"):
+                    return
                 await self.cache.invalidate_user_cache(owner_id, ("campaigns", "dashboard"))
                 await self._view_campaigns_menu(cq, owner_id)
             elif data == "np:cmp:new":
+                if not await self._require_feature(cq, owner_id, "campaigns"):
+                    return
                 await self._start_campaign_wizard(cq, owner_id)
             elif data.startswith("np:cmp:mode:"):
                 await self._wizard_pick_mode(cq, owner_id, data.split(":")[-1])
             elif data.startswith("np:cmp:folder:"):
                 await self._wizard_pick_folder(cq, owner_id, int(data.split(":")[-1]))
             elif data == "np:cmp:scan":
+                if not await self._require_feature(cq, owner_id, "campaigns"):
+                    return
                 await self._run_scan_groups(cq, owner_id)
             elif data.startswith("np:cmp:view:"):
+                if not await self._require_feature(cq, owner_id, "campaigns"):
+                    return
                 await self._view_campaign_detail(cq, owner_id, data.split(":")[-1])
             elif data.startswith("np:cmp:start:"):
+                if not await self._require_feature(cq, owner_id, "campaigns"):
+                    return
                 await self._action_campaign(cq, owner_id, data.split(":")[-1], "start")
             elif data.startswith("np:cmp:pause:"):
                 await self._action_campaign(cq, owner_id, data.split(":")[-1], "pause")
@@ -634,6 +966,8 @@ class NexaPilotBot:
             elif data.startswith("np:cmp:unblock:"):
                 await self._action_campaign(cq, owner_id, data.split(":")[-1], "unblock")
             elif data.startswith("np:cmp:rescan:"):
+                if not await self._require_feature(cq, owner_id, "campaigns"):
+                    return
                 await self._action_campaign(cq, owner_id, data.split(":")[-1], "rescan")
             elif data.startswith("np:cmp:groups:"):
                 await self._view_campaign_groups(cq, owner_id, data.split(":")[-1])
@@ -642,32 +976,58 @@ class NexaPilotBot:
             elif data.startswith("np:cmp:del:"):
                 await self._confirm_delete_campaign(cq, owner_id, data.split(":")[-1])
 
-            # ---- Auto-Replies Section ----
+            # ---- Auto-Replies Section (Ultra Premium Required) ----
             elif data == "np:auto":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._view_auto_menu(cq, owner_id)
             elif data == "np:mention":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._view_mention_menu(cq, owner_id)
             elif data == "np:mention:toggle":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._toggle_mention(cq, owner_id)
             elif data == "np:mention:set":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._prompt_set_auto(cq, owner_id, "mention_set", "Mention Auto-Reply")
             elif data == "np:welcome":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._view_welcome_menu(cq, owner_id)
             elif data == "np:welcome:toggle":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._toggle_welcome(cq, owner_id)
             elif data == "np:welcome:set":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._prompt_set_auto(cq, owner_id, "welcome_set", "Welcome DM Auto-Reply")
             elif data == "np:welcome:reset":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._reset_welcome(cq, owner_id)
             elif data == "np:offline":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._view_offline_menu(cq, owner_id)
             elif data == "np:offline:toggle":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._toggle_offline(cq, owner_id)
             elif data == "np:offline:mode":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._switch_offline_mode(cq, owner_id)
             elif data == "np:offline:set":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._prompt_set_auto(cq, owner_id, "offline_set", "Offline / Away DM")
             elif data == "np:offline:cd":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
                     return
@@ -679,8 +1039,12 @@ class NexaPilotBot:
                 )
                 await self.edit_ui(cq, r, self._cancel_kb("np:offline"))
             elif data == "np:kw":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 await self._view_keywords_menu(cq, owner_id)
             elif data == "np:kw:new":
+                if not await self._require_feature(cq, owner_id, "auto_replies"):
+                    return
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
                     return
@@ -694,10 +1058,14 @@ class NexaPilotBot:
             elif data.startswith("np:kw:del:"):
                 await self._delete_keyword_by_id(cq, owner_id, int(data.split(":")[-1]))
 
-            # ---- Schedules Section ----
+            # ---- Schedules Section (Premium / Ultra Required) ----
             elif data == "np:sched":
+                if not await self._require_feature(cq, owner_id, "schedules"):
+                    return
                 await self._view_schedules_menu(cq, owner_id)
             elif data == "np:sched:once":
+                if not await self._require_feature(cq, owner_id, "schedules"):
+                    return
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
                     return
@@ -710,6 +1078,8 @@ class NexaPilotBot:
                 r.line("Example: TPL-4F9A2B -1001234567890 2026-12-01 18:30")
                 await self.edit_ui(cq, r, self._cancel_kb("np:sched"))
             elif data == "np:sched:every":
+                if not await self._require_feature(cq, owner_id, "schedules"):
+                    return
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
                     return
@@ -731,15 +1101,20 @@ class NexaPilotBot:
     # -- Account Views, Ping & Real Telegram Logout --
 
     async def _check_account_limit(self, cq: CallbackQuery, owner_user_id: int) -> bool:
-        bot_user, accounts = await self._get_owner_profile(owner_user_id)
-        max_acc = int(bot_user.get("max_accounts", 1))
+        ent = await get_user_entitlement(self.db, self.cache, owner_user_id)
+        if not ent["is_active"]:
+            await self._require_feature(cq, owner_user_id)
+            return False
+        _, accounts = await self._get_owner_profile(owner_user_id)
+        max_acc = int(ent["max_accounts"])
         if len(accounts) >= max_acc:
             r = RichText()
             r.line("Account Limit Reached", icon="lock")
-            r.line(f"You already have {len(accounts)}/{max_acc} connected account(s).")
-            r.line("Disconnect & Logout your current account first to connect a different one.")
+            r.line(f"Your {ent['plan_name']} plan allows {max_acc} account(s) (used: {len(accounts)}/{max_acc}).")
+            r.line("Upgrade to Ultra Premium for more account slots, or Disconnect & Logout your current account.")
             kb = InlineKeyboardMarkup(
                 [
+                    [make_button("Upgrade Plan", "np:plans", "upgrade", style="success")],
                     [make_button("My Account", "np:acc", "my_account", style="primary")],
                     [make_button("Main Menu", "np:home", "home", style="primary")],
                 ]
@@ -1292,10 +1667,28 @@ class NexaPilotBot:
         await self.edit_ui(cq, r, kb)
 
     async def _start_campaign_wizard(self, cq: CallbackQuery, owner_id: int) -> None:
+        ent = await self._require_feature(cq, owner_id, "campaigns")
+        if not ent:
+            return
         acc = await self._require_account(owner_id, cq=cq)
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
+        existing_cmps = await self._get_cached_campaigns(owner_id, uid)
+        if len(existing_cmps) >= int(ent["max_campaigns"]):
+            r = RichText()
+            r.line("Campaign Limit Reached", icon="lock")
+            r.line(f"Your {ent['plan_name']} plan allows up to {ent['max_campaigns']} campaign(s).")
+            r.line("Upgrade your plan to run more campaigns simultaneously!")
+            kb = InlineKeyboardMarkup(
+                [
+                    [make_button("Upgrade Plan", "np:plans", "upgrade", style="success")],
+                    [make_button("Back", "np:cmp", "back", style="primary")],
+                ]
+            )
+            await self.edit_ui(cq, r, kb)
+            return
+
         tpls = await self._get_cached_templates(owner_id, uid)
         if not tpls:
             r = RichText()
@@ -1693,18 +2086,28 @@ class NexaPilotBot:
     # -- Interactive Private Text Step Router (Redis FSM) --
 
     async def _handle_private_text(self, _client: BotClient, message: BotMessage) -> None:
-        if not message.from_user or not message.text:
+        if not message.from_user:
             return
+        raw_text = (message.text or message.caption or "").strip()
+        has_photo = bool(getattr(message, "photo", None))
+        if not raw_text and not has_photo:
+            return
+
         owner_id = int(message.from_user.id)
         state = await self.cache.get_fsm(owner_id)
         if not state:
             return
 
         flow = state.get("flow")
-        text = message.text.strip()
+        text = raw_text
         chat_id = message.chat.id
 
         try:
+            if flow == "pay_proof":
+                await self._step_pay_proof(owner_id, chat_id, message, state)
+                return
+            if not message.text:
+                return
             if flow == "login_phone":
                 await self._step_login_phone(owner_id, chat_id, text)
             elif flow == "login_otp":
@@ -2375,3 +2778,341 @@ class NexaPilotBot:
                 ]
             )
             await self.send_ui(chat_id, r, kb)
+
+    # -----------------------------------------------------------------------
+    # Refer & Earn, Upgrade Plans, Multi-Method Payments & Admin Approvals
+    # -----------------------------------------------------------------------
+
+    async def _view_referral_menu(self, cq: CallbackQuery, owner_id: int) -> None:
+        ent = await get_user_entitlement(self.db, self.cache, owner_id)
+        ref_count = int(ent["referral_count"])
+        rewards = int(ent["referral_rewards_claimed"])
+        ref_link = (
+            f"https://t.me/{self.bot_username}?start=ref_{owner_id}"
+            if self.bot_username
+            else f"ref_{owner_id}"
+        )
+        share_text = quote(
+            f"Automate your Telegram groups & campaigns with NexaPilot! Join with my invite link: {ref_link}"
+        )
+        share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={share_text}"
+
+        r = RichText()
+        r.line("Refer & Earn Free Premium", icon="referral")
+        r.line("==========================")
+        r.line(
+            f"Invite {REFERRALS_REQUIRED} verified friends to earn +{REFERRAL_REWARD_DAYS} Days of {REFERRAL_REWARD_PLAN.title()}!",
+            icon="gift",
+        )
+        r.line(f"Verified Referrals: {ref_count} | Rewards Claimed: {rewards}", icon="stat")
+        r.line(f"Progress: {build_progress_bar(ref_count, REFERRALS_REQUIRED)}", icon="fire")
+        r.line("")
+        r.line("Your Personal Invite Link:")
+        r.line(ref_link)
+
+        kb = InlineKeyboardMarkup(
+            [
+                [make_button("Share Referral Link", url=share_url, emoji_key="share_ref", style="primary")],
+                [make_button("Upgrade / Plans", "np:plans", "upgrade", style="success")],
+                [make_button("Main Menu", "np:home", "home", style="primary")],
+            ]
+        )
+        await self.edit_ui(cq, r, kb)
+
+    async def _view_plans_menu(self, cq: CallbackQuery, owner_id: int) -> None:
+        ent = await get_user_entitlement(self.db, self.cache, owner_id)
+        prem = get_plan_config("premium")
+        ultra = get_plan_config("ultra")
+
+        r = RichText()
+        r.line("NexaPilot Plans & Pricing", icon="premium")
+        r.line("==========================")
+        r.line(f"Current Plan: {ent['plan_name']} ({ent['remaining_text']})", icon="timer")
+        r.line("")
+        r.line(
+            f"Premium — ৳{prem['price_bdt']} / ${prem['price_usd']} ({prem['duration_days']} days)",
+            icon="premium",
+        )
+        r.line(
+            f"• {prem['max_accounts']} Account | {prem['max_templates']} Templates | {prem['max_campaigns']} Campaigns"
+        )
+        r.line("• Unlocks Scheduled Posts (One-Time & Recurring)")
+        r.line("")
+        r.line(
+            f"Ultra Premium — ৳{ultra['price_bdt']} / ${ultra['price_usd']} ({ultra['duration_days']} days)",
+            icon="ultra",
+        )
+        r.line(
+            f"• {ultra['max_accounts']} Accounts | {ultra['max_templates']} Templates | {ultra['max_campaigns']} Campaigns"
+        )
+        r.line("• 100% Unlocked: Full Auto-Replies Suite + Schedules + All Features")
+
+        kb = InlineKeyboardMarkup(
+            [
+                [make_button(f"Choose Premium (৳{prem['price_bdt']} / ${prem['price_usd']})", "np:pay:plan:premium", "upgrade", style="success")],
+                [make_button(f"Choose Ultra (৳{ultra['price_bdt']} / ${ultra['price_usd']})", "np:pay:plan:ultra", "ultra", style="success")],
+                [make_button("Refer & Earn Free Days", "np:ref", "referral", style="primary")],
+                [make_button("Main Menu", "np:home", "home", style="primary")],
+            ]
+        )
+        await self.edit_ui(cq, r, kb)
+
+    async def _view_payment_methods(
+        self, cq: CallbackQuery, owner_id: int, plan_key: str
+    ) -> None:
+        if plan_key not in ("premium", "ultra"):
+            await self._view_plans_menu(cq, owner_id)
+            return
+        cfg = get_plan_config(plan_key)
+        methods = get_configured_payment_methods()
+
+        r = RichText()
+        r.line(f"Select Payment Method — {cfg['name']}", icon="payment")
+        r.line(f"Price: ৳{cfg['price_bdt']} BDT / ${cfg['price_usd']} USD ({cfg['duration_days']} days)", icon="timer")
+
+        rows: list[list[InlineKeyboardButton]] = []
+        if not methods:
+            r.line("No payment methods are configured on this server yet.", icon="warn")
+            r.line("Please contact the administrator.")
+        else:
+            r.line("Choose your preferred payment method below:")
+            for m in methods:
+                rows.append(
+                    [
+                        make_button(
+                            m["label"],
+                            f"np:pay:method:{plan_key}:{m['key']}",
+                            m["emoji_key"],
+                            style="primary",
+                        )
+                    ]
+                )
+
+        rows.append([make_button("Back to Plans", "np:plans", "back", style="primary")])
+        await self.edit_ui(cq, r, InlineKeyboardMarkup(rows))
+
+    async def _view_payment_instructions(
+        self, cq: CallbackQuery, owner_id: int, plan_key: str, method_key: str
+    ) -> None:
+        cfg = get_plan_config(plan_key)
+        method = get_payment_method(method_key)
+        if plan_key not in ("premium", "ultra") or not method:
+            await self._view_plans_menu(cq, owner_id)
+            return
+
+        amount = (
+            f"৳{cfg['price_bdt']} BDT"
+            if method["currency"] == "BDT"
+            else f"${cfg['price_usd']} USD"
+        )
+        r = RichText()
+        r.line(f"Payment Instructions — {method['label']}", icon="payment")
+        r.line("====================================")
+        r.line(f"Plan: {cfg['name']} ({cfg['duration_days']} days)", icon="premium" if plan_key == "premium" else "ultra")
+        r.line(f"Amount to Pay: {amount}", icon="fire")
+        r.line("")
+        r.line("Send payment to:")
+        r.line(method["details"])
+        r.line("")
+        r.line("After paying, tap 'Submit Payment Proof' and send your Transaction ID / Hash (or screenshot + TrxID).", icon="ok")
+
+        kb = InlineKeyboardMarkup(
+            [
+                [make_button("Submit Payment Proof", f"np:pay:submit:{plan_key}:{method_key}", "submit_proof", style="success")],
+                [
+                    make_button("Change Method", f"np:pay:plan:{plan_key}", "back", style="primary"),
+                    make_button("Cancel", "np:plans", "cancel", style="danger"),
+                ],
+            ]
+        )
+        await self.edit_ui(cq, r, kb)
+
+    async def _start_payment_proof_step(
+        self, cq: CallbackQuery, owner_id: int, plan_key: str, method_key: str
+    ) -> None:
+        method = get_payment_method(method_key)
+        if plan_key not in ("premium", "ultra") or not method:
+            await self._view_plans_menu(cq, owner_id)
+            return
+        await self.cache.set_fsm(
+            owner_id,
+            {"flow": "pay_proof", "plan": plan_key, "method": method_key},
+        )
+        r = RichText()
+        r.line("Submit Payment Proof", icon="payment")
+        r.line(f"Method: {method['label']} | Plan: {plan_key.title()}")
+        r.line("Send your Transaction ID / Tx Hash now.")
+        r.line("(You may also send a payment screenshot with the TrxID in the caption.)")
+        await self.edit_ui(cq, r, self._cancel_kb("np:plans"))
+
+    async def _step_pay_proof(
+        self,
+        owner_id: int,
+        chat_id: int,
+        message: BotMessage,
+        state: dict[str, Any],
+    ) -> None:
+        await self.cache.clear_fsm(owner_id)
+        plan_key = str(state.get("plan", "premium"))
+        method_key = str(state.get("method", "bkash"))
+        cfg = get_plan_config(plan_key)
+        method = get_payment_method(method_key)
+        if not method:
+            await self.send_ui(
+                chat_id,
+                RichText().line("Payment method is no longer available.", icon="err"),
+                self._main_menu_kb(),
+            )
+            return
+
+        trx_id = (message.text or message.caption or "").strip()
+        proof_file_id: str | None = None
+        if getattr(message, "photo", None):
+            proof_file_id = str(getattr(message.photo, "file_id", "") or "") or None
+        if not trx_id and proof_file_id:
+            trx_id = "SCREENSHOT_ATTACHED"
+        if not trx_id:
+            await self.send_ui(
+                chat_id,
+                RichText().line("Please provide a Transaction ID or screenshot.", icon="err"),
+                self._main_menu_kb(),
+            )
+            return
+
+        amount_display = (
+            f"৳{cfg['price_bdt']} BDT"
+            if method["currency"] == "BDT"
+            else f"${cfg['price_usd']} USD"
+        )
+        pay_row = await self.db.create_payment_request(
+            user_id=owner_id,
+            plan_type=plan_key,
+            duration_days=int(cfg["duration_days"]),
+            payment_method=method_key,
+            amount_display=amount_display,
+            trx_id=trx_id[:200],
+            proof_file_id=proof_file_id,
+        )
+
+        # Notify user
+        r_user = RichText()
+        r_user.line(f"Payment Proof Submitted ({pay_row['id']})", icon="pending")
+        r_user.line(f"Plan: {cfg['name']} ({cfg['duration_days']} days) | Amount: {amount_display}")
+        r_user.line(f"Method: {method['label']} | TrxID: {trx_id[:80]}")
+        r_user.line("An admin will review and activate your plan shortly!", icon="ok")
+        await self.send_ui(
+            chat_id,
+            r_user,
+            InlineKeyboardMarkup([[make_button("Main Menu", "np:home", "home", style="primary")]]),
+        )
+
+        # Notify all configured admins with Approve / Reject inline buttons
+        uname = getattr(message.from_user, "username", None)
+        fname = getattr(message.from_user, "first_name", "") or ""
+        r_adm = RichText()
+        r_adm.line(f"New Payment Request — {pay_row['id']}", icon="payment")
+        r_adm.line("================================")
+        r_adm.line(f"User: {fname} (@{uname or 'none'}) [{owner_id}]", icon="acc")
+        r_adm.line(f"Plan: {cfg['name']} ({cfg['duration_days']} days)", icon="premium" if plan_key == "premium" else "ultra")
+        r_adm.line(f"Method: {method['label']} | Amount: {amount_display}")
+        r_adm.line(f"TrxID / Proof: {trx_id[:160]}")
+        adm_kb = InlineKeyboardMarkup(
+            [
+                [
+                    make_button("Approve Payment", f"np:admin:approve:{pay_row['id']}", "approve", style="success"),
+                    make_button("Reject Payment", f"np:admin:reject:{pay_row['id']}", "reject", style="danger"),
+                ]
+            ]
+        )
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                if proof_file_id:
+                    await self.client.send_photo(chat_id=admin_id, photo=proof_file_id)
+                await self.send_ui(admin_id, r_adm, adm_kb)
+            except Exception as exc:
+                logger.warning("Failed to notify admin %s for payment %s: %s", admin_id, pay_row["id"], exc)
+
+    async def _handle_admin_payment_decision(
+        self,
+        cq: CallbackQuery,
+        admin_id: int,
+        pay_id: str,
+        *,
+        approve: bool,
+    ) -> None:
+        if admin_id not in ADMIN_USER_IDS:
+            return
+        pay = await self.db.get_payment_request(pay_id)
+        if not pay:
+            await self.edit_ui(cq, RichText().line(f"Payment {pay_id} not found.", icon="err"))
+            return
+        if pay.get("status") != "pending":
+            await self.edit_ui(
+                cq,
+                RichText().line(
+                    f"Payment {pay_id} was already {str(pay.get('status')).upper()}.",
+                    icon="warn",
+                ),
+            )
+            return
+
+        target_user_id = int(pay["user_id"])
+        now_iso = datetime.now(self.manager.tz).isoformat()
+
+        if approve:
+            await self.db.update_payment_request(
+                pay_id,
+                {"status": "approved", "reviewed_by": admin_id, "reviewed_at": now_iso},
+            )
+            ent = await grant_or_extend_plan(
+                self.db,
+                self.cache,
+                target_user_id,
+                str(pay["plan_type"]),
+                int(pay["duration_days"]),
+            )
+            r_adm = RichText()
+            r_adm.line(f"APPROVED — {pay_id}", icon="approved")
+            r_adm.line(f"User: {target_user_id} | Plan: {ent['plan_name']} (+{pay['duration_days']}d)")
+            r_adm.line(f"New Time Left: {ent['remaining_text']}", icon="timer")
+            await self.edit_ui(cq, r_adm)
+
+            r_usr = RichText()
+            r_usr.line(f"Payment Approved! ({pay_id})", icon="approved")
+            r_usr.line(f"Your {ent['plan_name']} plan is now LIVE!", icon="fire")
+            r_usr.line(f"Time Left: {ent['remaining_text']}", icon="timer")
+            try:
+                await self.send_ui(
+                    target_user_id,
+                    r_usr,
+                    InlineKeyboardMarkup([[make_button("Open Dashboard", "np:home", "home", style="success")]]),
+                )
+            except Exception as exc:
+                logger.warning("Could not notify user %s of payment approval: %s", target_user_id, exc)
+        else:
+            await self.db.update_payment_request(
+                pay_id,
+                {"status": "rejected", "reviewed_by": admin_id, "reviewed_at": now_iso},
+            )
+            r_adm = RichText()
+            r_adm.line(f"REJECTED — {pay_id}", icon="rejected")
+            r_adm.line(f"User: {target_user_id} | TrxID: {pay.get('trx_id')}")
+            await self.edit_ui(cq, r_adm)
+
+            r_usr = RichText()
+            r_usr.line(f"Payment Rejected ({pay_id})", icon="rejected")
+            r_usr.line("Your payment proof could not be verified. Please double-check and try again or contact support.", icon="warn")
+            try:
+                await self.send_ui(
+                    target_user_id,
+                    r_usr,
+                    InlineKeyboardMarkup(
+                        [
+                            [make_button("Try Again", "np:plans", "upgrade", style="primary")],
+                            [make_button("Main Menu", "np:home", "home", style="primary")],
+                        ]
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Could not notify user %s of payment rejection: %s", target_user_id, exc)
+

@@ -12,6 +12,7 @@ logger = logging.getLogger("nexapilot.redis")
 USER_CACHE_TTLS: dict[str, int] = {
     "profile": 120,
     "dashboard": 60,
+    "entitlement": 60,
     "templates": 180,
     "campaigns": 60,
     "settings": 180,

@@ -41,6 +41,19 @@ TEXT_EMOJIS: dict[str, tuple[str, int]] = {
     "cmp_running": ("🥳", int(os.environ.get("NEXA_EMOJI_CMP_RUN", "5197630131534836123"))),      # PLACEHOLDER
     "cmp_paused": ("😶", int(os.environ.get("NEXA_EMOJI_CMP_PAUSE", "6152025796610366536"))),     # PLACEHOLDER
     "ping": ("⚡", int(os.environ.get("NEXA_EMOJI_PING", "4949812133463327402"))),                # PLACEHOLDER
+    # Monetization, Force-Join, Trial, Referral & Payment Text Emojis (PLACEHOLDER)
+    "channel": ("📢", int(os.environ.get("NEXA_EMOJI_CHANNEL", "6003457174125155040"))),          # PLACEHOLDER
+    "trial": ("🎁", int(os.environ.get("NEXA_EMOJI_TRIAL", "5197630131534836123"))),              # PLACEHOLDER
+    "timer": ("⏳", int(os.environ.get("NEXA_EMOJI_TIMER", "4949861534177166038"))),              # PLACEHOLDER
+    "premium": ("💎", int(os.environ.get("NEXA_EMOJI_PREMIUM", "5353025608832004653"))),          # PLACEHOLDER
+    "ultra": ("👑", int(os.environ.get("NEXA_EMOJI_ULTRA", "5436386989857320953"))),              # PLACEHOLDER
+    "expired": ("⛔", int(os.environ.get("NEXA_EMOJI_EXPIRED", "5197396124536682206"))),          # PLACEHOLDER
+    "referral": ("🤝", int(os.environ.get("NEXA_EMOJI_REFERRAL", "5199885118214255386"))),        # PLACEHOLDER
+    "gift": ("🎉", int(os.environ.get("NEXA_EMOJI_GIFT", "5197630131534836123"))),                # PLACEHOLDER
+    "payment": ("💳", int(os.environ.get("NEXA_EMOJI_PAYMENT", "6025976946083500432"))),          # PLACEHOLDER
+    "pending": ("🕒", int(os.environ.get("NEXA_EMOJI_PENDING", "6152330430050738224"))),          # PLACEHOLDER
+    "approved": ("✅", int(os.environ.get("NEXA_EMOJI_APPROVED", "5323547156630483403"))),        # PLACEHOLDER
+    "rejected": ("❌", int(os.environ.get("NEXA_EMOJI_REJECTED", "5197396124536682206"))),        # PLACEHOLDER
 }
 
 BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
@@ -88,6 +101,23 @@ BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
     "rescan": ("👀", int(os.environ.get("NEXA_BTN_RESCAN", "6001071294022423174"))),
     "folder": ("📌", int(os.environ.get("NEXA_BTN_FOLDER", "6001087662142789242"))),
     "manage": ("✒️", int(os.environ.get("NEXA_BTN_MANAGE", "4949702513013031674"))),
+    # Monetization, Force-Join, Trial, Referral & Payment Buttons (PLACEHOLDER)
+    "locked": ("🔒", int(os.environ.get("NEXA_BTN_LOCKED", "5422858869372104873"))),
+    "join_channel": ("📢", int(os.environ.get("NEXA_BTN_JOIN_CHANNEL", "6003457174125155040"))),
+    "verify_join": ("✅", int(os.environ.get("NEXA_BTN_VERIFY_JOIN", "5323547156630483403"))),
+    "claim_trial": ("🎁", int(os.environ.get("NEXA_BTN_CLAIM_TRIAL", "5197630131534836123"))),
+    "upgrade": ("💎", int(os.environ.get("NEXA_BTN_UPGRADE", "5353025608832004653"))),
+    "ultra": ("👑", int(os.environ.get("NEXA_BTN_ULTRA", "5436386989857320953"))),
+    "referral": ("🤝", int(os.environ.get("NEXA_BTN_REFERRAL", "5199885118214255386"))),
+    "share_ref": ("📤", int(os.environ.get("NEXA_BTN_SHARE_REF", "6001404325786556105"))),
+    "pay_bkash": ("💸", int(os.environ.get("NEXA_BTN_PAY_BKASH", "6025976946083500432"))),
+    "pay_nagad": ("💵", int(os.environ.get("NEXA_BTN_PAY_NAGAD", "6025976946083500432"))),
+    "pay_rocket": ("🚀", int(os.environ.get("NEXA_BTN_PAY_ROCKET", "5353025608832004653"))),
+    "pay_crypto": ("🪙", int(os.environ.get("NEXA_BTN_PAY_CRYPTO", "5436386989857320953"))),
+    "pay_card": ("💳", int(os.environ.get("NEXA_BTN_PAY_CARD", "6025976946083500432"))),
+    "submit_proof": ("📩", int(os.environ.get("NEXA_BTN_SUBMIT_PROOF", "5323547156630483403"))),
+    "approve": ("✅", int(os.environ.get("NEXA_BTN_APPROVE", "5323547156630483403"))),
+    "reject": ("❌", int(os.environ.get("NEXA_BTN_REJECT", "5197396124536682206"))),
 }
 
 
@@ -126,17 +156,22 @@ def _resolve_button_style(style: str | None) -> Any:
 
 def make_button(
     label: str,
-    callback_data: str,
+    callback_data: str | None = None,
     emoji_key: str | None = None,
     style: str | None = None,
+    url: str | None = None,
 ) -> InlineKeyboardButton:
     """
-    Build an InlineKeyboardButton combining:
+    Build an InlineKeyboardButton (callback or URL) combining:
     - Premium Custom Emoji icon (icon_custom_emoji_id) when supported (no Unicode duplicate)
     - Telegram colored button style ('success'=Green, 'primary'=Blue, 'danger'=Red)
     Gracefully falls back without crashing if either parameter is unsupported.
     """
-    kwargs: dict[str, Any] = {"callback_data": callback_data}
+    kwargs: dict[str, Any] = {}
+    if url is not None:
+        kwargs["url"] = url
+    elif callback_data is not None:
+        kwargs["callback_data"] = callback_data
     btn_text = label
 
     if emoji_key and emoji_key in BUTTON_EMOJIS:

@@ -236,6 +236,7 @@ async def lifespan(_app: FastAPI):
         api_id=config["api_id"],
         api_hash=config["api_hash"],
         tz=tz,
+        cache=redis_cache,
     )
 
     scheduler.start()
