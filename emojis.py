@@ -41,19 +41,19 @@ TEXT_EMOJIS: dict[str, tuple[str, int]] = {
     "cmp_running": ("🥳", int(os.environ.get("NEXA_EMOJI_CMP_RUN", "5197630131534836123"))),      # PLACEHOLDER
     "cmp_paused": ("😶", int(os.environ.get("NEXA_EMOJI_CMP_PAUSE", "6152025796610366536"))),     # PLACEHOLDER
     "ping": ("⚡", int(os.environ.get("NEXA_EMOJI_PING", "4949812133463327402"))),                # PLACEHOLDER
-    # Monetization, Force-Join, Trial, Referral & Payment Text Emojis (PLACEHOLDER)
-    "channel": ("📢", int(os.environ.get("NEXA_EMOJI_CHANNEL", "6003457174125155040"))),          # PLACEHOLDER
-    "trial": ("🎁", int(os.environ.get("NEXA_EMOJI_TRIAL", "5197630131534836123"))),              # PLACEHOLDER
-    "timer": ("⏳", int(os.environ.get("NEXA_EMOJI_TIMER", "4949861534177166038"))),              # PLACEHOLDER
-    "premium": ("💎", int(os.environ.get("NEXA_EMOJI_PREMIUM", "5353025608832004653"))),          # PLACEHOLDER
-    "ultra": ("👑", int(os.environ.get("NEXA_EMOJI_ULTRA", "5436386989857320953"))),              # PLACEHOLDER
-    "expired": ("⛔", int(os.environ.get("NEXA_EMOJI_EXPIRED", "5197396124536682206"))),          # PLACEHOLDER
-    "referral": ("🤝", int(os.environ.get("NEXA_EMOJI_REFERRAL", "5199885118214255386"))),        # PLACEHOLDER
-    "gift": ("🎉", int(os.environ.get("NEXA_EMOJI_GIFT", "5197630131534836123"))),                # PLACEHOLDER
-    "payment": ("💳", int(os.environ.get("NEXA_EMOJI_PAYMENT", "6025976946083500432"))),          # PLACEHOLDER
-    "pending": ("🕒", int(os.environ.get("NEXA_EMOJI_PENDING", "6152330430050738224"))),          # PLACEHOLDER
-    "approved": ("✅", int(os.environ.get("NEXA_EMOJI_APPROVED", "5323547156630483403"))),        # PLACEHOLDER
-    "rejected": ("❌", int(os.environ.get("NEXA_EMOJI_REJECTED", "5197396124536682206"))),        # PLACEHOLDER
+    # Monetization, Force-Join, Trial, Referral & Payment Text Emojis (VERIFIED)
+    "channel": ("📢", int(os.environ.get("NEXA_EMOJI_CHANNEL", "5463162769463328619"))),          # VERIFIED
+    "trial": ("🎁", int(os.environ.get("NEXA_EMOJI_TRIAL", "5848011690523758177"))),              # VERIFIED
+    "timer": ("⏳", int(os.environ.get("NEXA_EMOJI_TIMER", "6307361565272186088"))),              # VERIFIED
+    "premium": ("💎", int(os.environ.get("NEXA_EMOJI_PREMIUM", "5235630047959727475"))),          # VERIFIED
+    "ultra": ("👑", int(os.environ.get("NEXA_EMOJI_ULTRA", "5368493353727968677"))),              # VERIFIED
+    "expired": ("🚫", int(os.environ.get("NEXA_EMOJI_EXPIRED", "5240241223632954241"))),          # VERIFIED
+    "referral": ("🤝", int(os.environ.get("NEXA_EMOJI_REFERRAL", "5388974008358155723"))),        # VERIFIED
+    "gift": ("🎉", int(os.environ.get("NEXA_EMOJI_GIFT", "5787310874779717147"))),                # VERIFIED
+    "payment": ("💳", int(os.environ.get("NEXA_EMOJI_PAYMENT", "5445353829304387411"))),          # VERIFIED
+    "pending": ("🌐", int(os.environ.get("NEXA_EMOJI_PENDING", "5350361990374138712"))),          # VERIFIED
+    "approved": ("✅", int(os.environ.get("NEXA_EMOJI_APPROVED", "5384611567125928766"))),        # VERIFIED
+    "rejected": ("❌", int(os.environ.get("NEXA_EMOJI_REJECTED", "5904704361182798355"))),        # VERIFIED
 }
 
 BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
@@ -101,23 +101,23 @@ BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
     "rescan": ("👀", int(os.environ.get("NEXA_BTN_RESCAN", "6001071294022423174"))),
     "folder": ("📌", int(os.environ.get("NEXA_BTN_FOLDER", "6001087662142789242"))),
     "manage": ("✒️", int(os.environ.get("NEXA_BTN_MANAGE", "4949702513013031674"))),
-    # Monetization, Force-Join, Trial, Referral & Payment Buttons (PLACEHOLDER)
-    "locked": ("🔒", int(os.environ.get("NEXA_BTN_LOCKED", "5422858869372104873"))),
-    "join_channel": ("📢", int(os.environ.get("NEXA_BTN_JOIN_CHANNEL", "6003457174125155040"))),
-    "verify_join": ("✅", int(os.environ.get("NEXA_BTN_VERIFY_JOIN", "5323547156630483403"))),
-    "claim_trial": ("🎁", int(os.environ.get("NEXA_BTN_CLAIM_TRIAL", "5197630131534836123"))),
-    "upgrade": ("💎", int(os.environ.get("NEXA_BTN_UPGRADE", "5353025608832004653"))),
-    "ultra": ("👑", int(os.environ.get("NEXA_BTN_ULTRA", "5436386989857320953"))),
-    "referral": ("🤝", int(os.environ.get("NEXA_BTN_REFERRAL", "5199885118214255386"))),
-    "share_ref": ("📤", int(os.environ.get("NEXA_BTN_SHARE_REF", "6001404325786556105"))),
-    "pay_bkash": ("💸", int(os.environ.get("NEXA_BTN_PAY_BKASH", "6025976946083500432"))),
-    "pay_nagad": ("💵", int(os.environ.get("NEXA_BTN_PAY_NAGAD", "6025976946083500432"))),
-    "pay_rocket": ("🚀", int(os.environ.get("NEXA_BTN_PAY_ROCKET", "5353025608832004653"))),
-    "pay_crypto": ("🪙", int(os.environ.get("NEXA_BTN_PAY_CRYPTO", "5436386989857320953"))),
-    "pay_card": ("💳", int(os.environ.get("NEXA_BTN_PAY_CARD", "6025976946083500432"))),
-    "submit_proof": ("📩", int(os.environ.get("NEXA_BTN_SUBMIT_PROOF", "5323547156630483403"))),
-    "approve": ("✅", int(os.environ.get("NEXA_BTN_APPROVE", "5323547156630483403"))),
-    "reject": ("❌", int(os.environ.get("NEXA_BTN_REJECT", "5197396124536682206"))),
+    # Monetization, Force-Join, Trial, Referral & Payment Buttons (VERIFIED)
+    "locked": ("🔒", int(os.environ.get("NEXA_BTN_LOCKED", "5269770107340463723"))),
+    "join_channel": ("📡", int(os.environ.get("NEXA_BTN_JOIN_CHANNEL", "5296369303661067030"))),
+    "verify_join": ("☑️", int(os.environ.get("NEXA_BTN_VERIFY_JOIN", "5382141192131589941"))),
+    "claim_trial": ("🎁", int(os.environ.get("NEXA_BTN_CLAIM_TRIAL", "5784964035929707157"))),
+    "upgrade": ("💎", int(os.environ.get("NEXA_BTN_UPGRADE", "5201914481671682382"))),
+    "ultra": ("⚡️", int(os.environ.get("NEXA_BTN_ULTRA", "5370909405975953360"))),
+    "referral": ("🤝", int(os.environ.get("NEXA_BTN_REFERRAL", "5963267335480415417"))),
+    "share_ref": ("📤", int(os.environ.get("NEXA_BTN_SHARE_REF", "5264759912025564026"))),
+    "pay_bkash": ("💰", int(os.environ.get("NEXA_BTN_PAY_BKASH", "5987880246865565644"))),
+    "pay_nagad": ("💴", int(os.environ.get("NEXA_BTN_PAY_NAGAD", "6082388335039351641"))),
+    "pay_rocket": ("💷", int(os.environ.get("NEXA_BTN_PAY_ROCKET", "6084843995475742197"))),
+    "pay_crypto": ("😊", int(os.environ.get("NEXA_BTN_PAY_CRYPTO", "5375120058768974077"))),
+    "pay_card": ("💳", int(os.environ.get("NEXA_BTN_PAY_CARD", "5199953902115503867"))),
+    "submit_proof": ("➡️", int(os.environ.get("NEXA_BTN_SUBMIT_PROOF", "4956578755653927659"))),
+    "approve": ("❤️", int(os.environ.get("NEXA_BTN_APPROVE", "6258259403200270844"))),
+    "reject": ("👎", int(os.environ.get("NEXA_BTN_REJECT", "6267000941547885720"))),
 }
 
 
