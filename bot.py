@@ -265,37 +265,25 @@ class NexaPilotBot:
         rich: RichText,
         markup: InlineKeyboardMarkup | None = None,
     ) -> None:
-        """Unified editor: guarantees Premium Custom Emojis survive every button click & submenu edit."""
+        """
+        Unified editor: invokes raw messages.EditMessage FIRST so ftmgram's
+        high-level edit_message_text wrapper cannot silently strip CUSTOM_EMOJI
+        entities, while preserving all button icons and color styles.
+        """
         text, entities = render_ui_message(rich)
         chat_id = cq.message.chat.id
         msg_id = cq.message.id
 
-        # 1. Try high-level edit_message_text with explicit entities + ParseMode.DISABLED
-        try:
-            await self.client.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=text,
-                entities=entities or None,
-                parse_mode=BotParseMode.DISABLED,
-                reply_markup=markup,
-            )
-            return
-        except Exception as exc:
-            if "MESSAGE_NOT_MODIFIED" in str(exc).upper():
-                return
-            logger.debug("edit_message_text(entities=...) fell back (%s); using raw EditMessage.", exc)
-
-        # 2. Try raw messages.EditMessage with raw MessageEntityCustomEmoji + sync/async markup.write
+        # 1. Primary: raw messages.EditMessage with explicit MessageEntityCustomEmoji
         try:
             await self._raw_edit_with_entities(chat_id, msg_id, text, entities, markup)
             return
         except Exception as raw_exc:
             if "MESSAGE_NOT_MODIFIED" in str(raw_exc).upper():
                 return
-            logger.debug("raw EditMessage failed (%s); trying HTML custom emoji edit.", raw_exc)
+            logger.warning("raw EditMessage failed (%s); trying HTML custom emoji edit.", raw_exc)
 
-        # 3. Try HTML <emoji id="...">...</emoji> edit
+        # 2. Fallback: HTML <emoji id="...">...</emoji> edit
         try:
             await self.client.edit_message_text(
                 chat_id=chat_id,
@@ -308,20 +296,21 @@ class NexaPilotBot:
         except Exception as html_exc:
             if "MESSAGE_NOT_MODIFIED" in str(html_exc).upper():
                 return
-            logger.warning("edit_ui HTML fallback failed (%s); falling back to plain text.", html_exc)
+            logger.warning("edit_ui HTML fallback failed (%s); trying entities edit.", html_exc)
 
-        # 4. Last-resort plain text edit
+        # 3. Last-resort high-level edit_message_text
         try:
             await self.client.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg_id,
                 text=text,
+                entities=entities or None,
                 parse_mode=BotParseMode.DISABLED,
                 reply_markup=markup,
             )
         except Exception as plain_exc:
             if "MESSAGE_NOT_MODIFIED" not in str(plain_exc).upper():
-                logger.warning("edit_ui plain fallback failed: %s", plain_exc)
+                logger.warning("edit_ui final fallback failed: %s", plain_exc)
 
     # -----------------------------------------------------------------------
     # Cache-Aside Per-User Data Loaders (Strictly Scoped by owner_user_id)
