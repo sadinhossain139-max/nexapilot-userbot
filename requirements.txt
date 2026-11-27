@@ -5,3 +5,4 @@ ftmgram==3.5.8
 supabase==2.34.1
 apscheduler==3.11.3
 pydantic==2.14.4
+redis>=5.0.0

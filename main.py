@@ -104,6 +104,7 @@ config: dict[str, Any] = {}
 scheduler: AsyncIOScheduler | None = None
 db_store: SupabaseStore | None = None
 userbot_manager: UserbotManager | None = None
+redis_cache: Any = None
 nexapilot_bot: Any = None
 
 
@@ -217,10 +218,15 @@ async def _finalize_login(auth_session_id: str, entry: PendingAuth) -> dict[str,
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global config, scheduler, db_store, userbot_manager, nexapilot_bot
+    global config, scheduler, db_store, userbot_manager, redis_cache, nexapilot_bot
 
     config = get_env_config()
     tz = config["timezone"]
+
+    from redis_cache import RedisCache
+
+    redis_cache = RedisCache()
+    await redis_cache.connect()
 
     scheduler = AsyncIOScheduler(timezone=tz)
     db_store = SupabaseStore(config["supabase_url"], config["supabase_key"])
@@ -255,6 +261,7 @@ async def lifespan(_app: FastAPI):
                 api_hash=config["api_hash"],
                 db=db_store,
                 manager=userbot_manager,
+                cache=redis_cache,
             )
             await nexapilot_bot.start()
         except Exception as exc:
@@ -263,7 +270,7 @@ async def lifespan(_app: FastAPI):
     else:
         logger.info("BOT_TOKEN not set; running userbot backend without NexaPilot bot.")
 
-    logger.info("NexaPilot Userbot Automation Server is ready (Kurigram + ftmgram).")
+    logger.info("NexaPilot Userbot Automation Server is ready (Kurigram + ftmgram + Redis).")
 
     try:
         yield
@@ -283,12 +290,16 @@ async def lifespan(_app: FastAPI):
 
         if userbot_manager is not None:
             await userbot_manager.stop_all_clients()
+
+        if redis_cache is not None:
+            await redis_cache.close()
+            redis_cache = None
         logger.info("Shutdown complete.")
 
 
 app = FastAPI(
     title="NexaPilot — Telegram Userbot Automation Server",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -317,6 +328,7 @@ async def health_check() -> dict[str, Any]:
     return {
         "status": "ok",
         "bot_running": bool(nexapilot_bot and nexapilot_bot.is_running),
+        "redis_connected": bool(redis_cache and redis_cache.is_connected),
         "active_clients": count,
         "active_by_source": by_source,
         "running_campaigns": running_campaigns,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import inspect
 import logging
 import os
@@ -91,44 +92,76 @@ BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
 
 
 # ---------------------------------------------------------------------------
-# Runtime Detection of ftmgram InlineKeyboardButton icon_custom_emoji_id
+# Runtime Detection of ftmgram InlineKeyboardButton icon_custom_emoji_id & style
 # ---------------------------------------------------------------------------
 
 _IKB_PARAMS = inspect.signature(InlineKeyboardButton.__init__).parameters
 BUTTON_CUSTOM_EMOJI_SUPPORTED: bool = "icon_custom_emoji_id" in _IKB_PARAMS
+BUTTON_STYLE_SUPPORTED: bool = "style" in _IKB_PARAMS
+
 _IKB_ICON_IS_INT: bool = False
 if BUTTON_CUSTOM_EMOJI_SUPPORTED:
     _ann = str(_IKB_PARAMS["icon_custom_emoji_id"].annotation)
     _IKB_ICON_IS_INT = "int" in _ann and "str" not in _ann
+
+try:
+    from ftmgram.enums import ButtonStyle as _ButtonStyle
+except ImportError:
+    _ButtonStyle = None
+
+
+def _resolve_button_style(style: str | None) -> Any:
+    """Resolve 'success' | 'primary' | 'danger' to ftmgram ButtonStyle enum or string."""
+    if not style or not BUTTON_STYLE_SUPPORTED:
+        return None
+    norm = style.strip().lower()
+    if norm not in ("success", "primary", "danger"):
+        return None
+    if _ButtonStyle is not None:
+        enum_val = getattr(_ButtonStyle, norm.upper(), None)
+        if enum_val is not None:
+            return enum_val
+    return norm
 
 
 def make_button(
     label: str,
     callback_data: str,
     emoji_key: str | None = None,
+    style: str | None = None,
 ) -> InlineKeyboardButton:
     """
-    Build an InlineKeyboardButton with a Premium Custom Emoji icon when supported
-    by the installed ftmgram version (without duplicating Unicode emojis in text).
-    Falls back cleanly to standard emoji prefix if icon_custom_emoji_id is absent.
+    Build an InlineKeyboardButton combining:
+    - Premium Custom Emoji icon (icon_custom_emoji_id) when supported (no Unicode duplicate)
+    - Telegram colored button style ('success'=Green, 'primary'=Blue, 'danger'=Red)
+    Gracefully falls back without crashing if either parameter is unsupported.
     """
+    kwargs: dict[str, Any] = {"callback_data": callback_data}
+    btn_text = label
+
     if emoji_key and emoji_key in BUTTON_EMOJIS:
         fallback_char, cid = BUTTON_EMOJIS[emoji_key]
         if BUTTON_CUSTOM_EMOJI_SUPPORTED:
-            icon_val: int | str = int(cid) if _IKB_ICON_IS_INT else str(cid)
-            try:
-                return InlineKeyboardButton(
-                    text=label,
-                    callback_data=callback_data,
-                    icon_custom_emoji_id=icon_val,
-                )
-            except TypeError:
-                pass
-        return InlineKeyboardButton(
-            text=f"{fallback_char} {label}",
-            callback_data=callback_data,
-        )
-    return InlineKeyboardButton(text=label, callback_data=callback_data)
+            kwargs["icon_custom_emoji_id"] = int(cid) if _IKB_ICON_IS_INT else str(cid)
+        else:
+            btn_text = f"{fallback_char} {label}"
+
+    resolved_style = _resolve_button_style(style)
+    if resolved_style is not None:
+        kwargs["style"] = resolved_style
+
+    try:
+        return InlineKeyboardButton(text=btn_text, **kwargs)
+    except TypeError:
+        # Retry without style if enum/str mismatch, then without icon_custom_emoji_id
+        kwargs.pop("style", None)
+        try:
+            return InlineKeyboardButton(text=btn_text, **kwargs)
+        except TypeError:
+            kwargs.pop("icon_custom_emoji_id", None)
+            if emoji_key and emoji_key in BUTTON_EMOJIS and btn_text == label:
+                btn_text = f"{BUTTON_EMOJIS[emoji_key][0]} {label}"
+            return InlineKeyboardButton(text=btn_text, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +204,14 @@ class RichText:
 
     def __init__(self) -> None:
         self._parts: list[str] = []
+        self._html_parts: list[str] = []
         self._entities: list[MessageEntity] = []
         self._offset: int = 0
 
     def add(self, text: str) -> "RichText":
         if text:
             self._parts.append(text)
+            self._html_parts.append(html.escape(text))
             self._offset += utf16_len(text)
         return self
 
@@ -196,6 +231,7 @@ class RichText:
             )
         )
         self._parts.append(char)
+        self._html_parts.append(f'<emoji id="{int(cid)}">{html.escape(char)}</emoji>')
         self._offset += length
         return self
 
@@ -208,6 +244,9 @@ class RichText:
 
     def build(self) -> tuple[str, list[MessageEntity]]:
         return "".join(self._parts).rstrip("\n"), self._entities
+
+    def build_html(self) -> str:
+        return "".join(self._html_parts).rstrip("\n")
 
 
 def render_ui_message(rich: RichText) -> tuple[str, list[MessageEntity]]:

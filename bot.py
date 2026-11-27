@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 import uuid
@@ -46,6 +47,7 @@ from pyrogram.errors import (
 
 from emojis import (
     BUTTON_CUSTOM_EMOJI_SUPPORTED,
+    BUTTON_STYLE_SUPPORTED,
     RichText,
     deserialize_to_ftmgram_entities,
     make_button,
@@ -53,6 +55,7 @@ from emojis import (
     serialize_bot_entities,
     utf16_len,
 )
+from redis_cache import RedisCache
 from userbot import (
     CLIENT_APP_VERSION,
     CLIENT_DEVICE_MODEL,
@@ -76,12 +79,12 @@ BOT_AUTH_TTL_SECONDS = 600.0  # 10 minutes
 
 
 # ---------------------------------------------------------------------------
-# NexaPilot Multi-User Bot Controller (ftmgram)
+# NexaPilot Multi-User Bot Controller (ftmgram + Redis Fast-UI Cache)
 # ---------------------------------------------------------------------------
 
 
 class NexaPilotBot:
-    """Multi-user inline control panel for NexaPilot using ftmgram."""
+    """Multi-user inline control panel for NexaPilot using ftmgram and Redis cache."""
 
     def __init__(
         self,
@@ -90,12 +93,14 @@ class NexaPilotBot:
         api_hash: str,
         db: SupabaseStore,
         manager: UserbotManager,
+        cache: RedisCache | None = None,
     ) -> None:
         self.bot_token = bot_token
         self.api_id = api_id
         self.api_hash = api_hash
         self.db = db
         self.manager = manager
+        self.cache = cache if cache is not None else RedisCache("")
 
         self.client = BotClient(
             name="nexapilot_bot",
@@ -105,8 +110,6 @@ class NexaPilotBot:
             in_memory=True,
         )
 
-        # Per-owner interactive conversation state: owner_user_id -> dict
-        self._states: dict[int, dict[str, Any]] = {}
         # Per-owner temporary Kurigram login client: owner_user_id -> dict
         self._pending_logins: dict[int, dict[str, Any]] = {}
         self.is_running: bool = False
@@ -143,16 +146,17 @@ class NexaPilotBot:
         self.is_running = True
         me = await self.client.get_me()
         logger.info(
-            "NexaPilot ftmgram Bot started as @%s (id=%s, button_custom_emoji=%s)",
+            "NexaPilot ftmgram Bot started as @%s (id=%s, button_emoji=%s, button_style=%s, redis=%s)",
             me.username,
             me.id,
             BUTTON_CUSTOM_EMOJI_SUPPORTED,
+            BUTTON_STYLE_SUPPORTED,
+            self.cache.is_connected,
         )
 
     async def stop(self) -> None:
         for owner_id in list(self._pending_logins.keys()):
             await self._cleanup_login(owner_id)
-        self._states.clear()
         if self.is_running:
             try:
                 await self.client.stop()
@@ -188,7 +192,11 @@ class NexaPilotBot:
         entities: list[MessageEntity],
         markup: InlineKeyboardMarkup | None,
     ) -> None:
-        """Fallback raw EditMessage that guarantees CUSTOM_EMOJI entities survive edits."""
+        """
+        Raw messages.EditMessage fallback that guarantees CUSTOM_EMOJI entities
+        AND inline button icons/styles survive edits in all ftmgram builds.
+        Handles both synchronous and async InlineKeyboardMarkup.write().
+        """
         peer = await self.client.resolve_peer(chat_id)
         raw_entities = []
         for ent in entities:
@@ -201,7 +209,12 @@ class NexaPilotBot:
                         document_id=int(cid),
                     )
                 )
-        raw_markup = await markup.write(self.client) if markup is not None else None
+
+        raw_markup = None
+        if markup is not None:
+            written = markup.write(self.client)
+            raw_markup = await written if inspect.isawaitable(written) else written
+
         await self.client.invoke(
             bot_raw.functions.messages.EditMessage(
                 peer=peer,
@@ -212,12 +225,13 @@ class NexaPilotBot:
             )
         )
 
-    async def _send_rich(
+    async def send_ui(
         self,
         chat_id: int,
         rich: RichText,
         markup: InlineKeyboardMarkup | None = None,
     ) -> BotMessage:
+        """Unified sender: preserves Premium Custom Emojis in 100% of new bot messages."""
         text, entities = render_ui_message(rich)
         try:
             return await self.client.send_message(
@@ -228,23 +242,35 @@ class NexaPilotBot:
                 reply_markup=markup,
             )
         except Exception as exc:
-            logger.warning("send_message with custom entities failed (%s); falling back.", exc)
-            return await self.client.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=BotParseMode.DISABLED,
-                reply_markup=markup,
-            )
+            logger.warning("send_ui entities mode failed (%s); trying HTML custom emoji mode.", exc)
+            try:
+                return await self.client.send_message(
+                    chat_id=chat_id,
+                    text=rich.build_html(),
+                    parse_mode=BotParseMode.HTML,
+                    reply_markup=markup,
+                )
+            except Exception as html_exc:
+                logger.warning("send_ui HTML fallback failed (%s); sending plain text.", html_exc)
+                return await self.client.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=BotParseMode.DISABLED,
+                    reply_markup=markup,
+                )
 
-    async def _edit_rich(
+    async def edit_ui(
         self,
         cq: CallbackQuery,
         rich: RichText,
         markup: InlineKeyboardMarkup | None = None,
     ) -> None:
+        """Unified editor: guarantees Premium Custom Emojis survive every button click & submenu edit."""
         text, entities = render_ui_message(rich)
         chat_id = cq.message.chat.id
         msg_id = cq.message.id
+
+        # 1. Try high-level edit_message_text with explicit entities + ParseMode.DISABLED
         try:
             await self.client.edit_message_text(
                 chat_id=chat_id,
@@ -254,45 +280,131 @@ class NexaPilotBot:
                 parse_mode=BotParseMode.DISABLED,
                 reply_markup=markup,
             )
-        except TypeError:
-            # Some ftmgram builds don't expose `entities` on high-level edit_message_text;
-            # invoke raw EditMessage so Premium Custom Emojis are preserved 100%.
-            try:
-                await self._raw_edit_with_entities(chat_id, msg_id, text, entities, markup)
-            except Exception as raw_exc:
-                if "MESSAGE_NOT_MODIFIED" in str(raw_exc).upper():
-                    return
-                logger.warning("raw EditMessage with entities failed: %s", raw_exc)
-                await self.client.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=text,
-                    parse_mode=BotParseMode.DISABLED,
-                    reply_markup=markup,
-                )
+            return
         except Exception as exc:
             if "MESSAGE_NOT_MODIFIED" in str(exc).upper():
                 return
-            logger.warning("edit_message_text with custom entities failed (%s); trying raw edit.", exc)
-            try:
-                await self._raw_edit_with_entities(chat_id, msg_id, text, entities, markup)
-            except Exception as raw_exc:
-                if "MESSAGE_NOT_MODIFIED" in str(raw_exc).upper():
-                    return
-                logger.warning("Fallback edit failed: %s", raw_exc)
+            logger.debug("edit_message_text(entities=...) fell back (%s); using raw EditMessage.", exc)
 
-    # -- Multi-User Isolation Helpers --
+        # 2. Try raw messages.EditMessage with raw MessageEntityCustomEmoji + sync/async markup.write
+        try:
+            await self._raw_edit_with_entities(chat_id, msg_id, text, entities, markup)
+            return
+        except Exception as raw_exc:
+            if "MESSAGE_NOT_MODIFIED" in str(raw_exc).upper():
+                return
+            logger.debug("raw EditMessage failed (%s); trying HTML custom emoji edit.", raw_exc)
+
+        # 3. Try HTML <emoji id="...">...</emoji> edit
+        try:
+            await self.client.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=rich.build_html(),
+                parse_mode=BotParseMode.HTML,
+                reply_markup=markup,
+            )
+            return
+        except Exception as html_exc:
+            if "MESSAGE_NOT_MODIFIED" in str(html_exc).upper():
+                return
+            logger.warning("edit_ui HTML fallback failed (%s); falling back to plain text.", html_exc)
+
+        # 4. Last-resort plain text edit
+        try:
+            await self.client.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode=BotParseMode.DISABLED,
+                reply_markup=markup,
+            )
+        except Exception as plain_exc:
+            if "MESSAGE_NOT_MODIFIED" not in str(plain_exc).upper():
+                logger.warning("edit_ui plain fallback failed: %s", plain_exc)
+
+    # -----------------------------------------------------------------------
+    # Cache-Aside Per-User Data Loaders (Strictly Scoped by owner_user_id)
+    # -----------------------------------------------------------------------
 
     async def _ensure_bot_user(self, user: Any) -> dict[str, Any]:
-        return await self.db.upsert_bot_user(
-            owner_user_id=int(user.id),
+        owner_id = int(user.id)
+        cached = await self.cache.get_user_cache(owner_id, "profile")
+        if cached and cached.get("bot_user"):
+            return cached["bot_user"]
+        bot_user = await self.db.upsert_bot_user(
+            owner_user_id=owner_id,
             username=getattr(user, "username", None),
             first_name=getattr(user, "first_name", None),
         )
+        accounts = await self.db.get_owner_accounts(owner_id)
+        await self.cache.set_user_cache(
+            owner_id, "profile", {"bot_user": bot_user, "accounts": accounts}
+        )
+        return bot_user
+
+    async def _get_owner_profile(self, owner_user_id: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        cached = await self.cache.get_user_cache(owner_user_id, "profile")
+        if cached and "bot_user" in cached and "accounts" in cached:
+            return cached["bot_user"], cached["accounts"]
+        bot_user = await self.db.get_bot_user(owner_user_id) or {"max_accounts": 1}
+        accounts = await self.db.get_owner_accounts(owner_user_id)
+        await self.cache.set_user_cache(
+            owner_user_id, "profile", {"bot_user": bot_user, "accounts": accounts}
+        )
+        return bot_user, accounts
 
     async def _get_owned_account(self, owner_user_id: int) -> dict[str, Any] | None:
-        accounts = await self.db.get_owner_accounts(owner_user_id)
+        _, accounts = await self._get_owner_profile(owner_user_id)
         return accounts[0] if accounts else None
+
+    async def _get_cached_templates(self, owner_id: int, uid: int) -> list[dict[str, Any]]:
+        cached = await self.cache.get_user_cache(owner_id, "templates")
+        if isinstance(cached, list):
+            return cached
+        rows = await self.db.list_templates(uid)
+        await self.cache.set_user_cache(owner_id, "templates", rows)
+        return rows
+
+    async def _get_cached_campaigns(self, owner_id: int, uid: int) -> list[dict[str, Any]]:
+        cached = await self.cache.get_user_cache(owner_id, "campaigns")
+        if isinstance(cached, list):
+            return cached
+        rows = await self.db.list_campaigns(uid)
+        await self.cache.set_user_cache(owner_id, "campaigns", rows)
+        return rows
+
+    async def _get_cached_schedules(self, owner_id: int, uid: int) -> list[dict[str, Any]]:
+        cached = await self.cache.get_user_cache(owner_id, "schedules")
+        if isinstance(cached, list):
+            return cached
+        rows = await self.db.list_active_scheduled_posts(uid)
+        await self.cache.set_user_cache(owner_id, "schedules", rows)
+        return rows
+
+    async def _get_cached_settings(self, owner_id: int, uid: int) -> dict[str, Any]:
+        cached = await self.cache.get_user_cache(owner_id, "settings")
+        if isinstance(cached, dict):
+            return cached
+        m_on, m_tpl = self.manager._mention_cache.get(uid, (False, None))
+        w_on, w_tpl = self.manager._welcome_cache.get(uid, (False, None))
+        o_on, o_mode, o_tpl, o_cd = self.manager._offline_cache.get(
+            uid, (False, "manual", None, DEFAULT_OFFLINE_COOLDOWN_SECONDS)
+        )
+        kws = await self.db.list_keyword_replies(uid)
+        payload = {
+            "mention_enabled": m_on,
+            "mention_template_id": m_tpl,
+            "welcome_enabled": w_on,
+            "welcome_template_id": w_tpl,
+            "offline_enabled": o_on,
+            "offline_mode": o_mode,
+            "offline_template_id": o_tpl,
+            "offline_cooldown_seconds": o_cd,
+            "keyword_replies": kws,
+        }
+        await self.cache.set_user_cache(owner_id, "settings", payload)
+        return payload
 
     async def _require_account(
         self,
@@ -308,52 +420,85 @@ class NexaPilotBot:
         r.line("Connect your Telegram account first to use this feature.")
         kb = InlineKeyboardMarkup(
             [
-                [make_button("Add Account", "np:acc", "connect_otp")],
-                [make_button("Main Menu", "np:home", "home")],
+                [make_button("Add Account", "np:acc", "connect_otp", style="success")],
+                [make_button("Main Menu", "np:home", "home", style="primary")],
             ]
         )
         if cq is not None:
-            await self._edit_rich(cq, r, kb)
+            await self.edit_ui(cq, r, kb)
         elif chat_id is not None:
-            await self._send_rich(chat_id, r, kb)
+            await self.send_ui(chat_id, r, kb)
         return None
 
-    # -- Keyboards (100% Built via make_button with Premium Emoji Icons) --
+    # -- Keyboards (Colored Buttons + Premium Custom Emoji Icons) --
 
     def _main_menu_kb(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
                 [
-                    make_button("My Account", "np:acc", "my_account"),
-                    make_button("Templates", "np:tpl", "templates"),
+                    make_button("My Account", "np:acc", "my_account", style="primary"),
+                    make_button("Templates", "np:tpl", "templates", style="primary"),
                 ],
                 [
-                    make_button("Campaigns", "np:cmp", "campaigns"),
-                    make_button("Auto-Replies", "np:auto", "auto_replies"),
+                    make_button("Campaigns", "np:cmp", "campaigns", style="primary"),
+                    make_button("Auto-Replies", "np:auto", "auto_replies", style="primary"),
                 ],
                 [
-                    make_button("Schedules", "np:sched", "schedules"),
-                    make_button("Status & Health", "np:status", "status_health"),
+                    make_button("Schedules", "np:sched", "schedules", style="primary"),
+                    make_button("Status & Health", "np:status", "status_health", style="primary"),
                 ],
                 [
-                    make_button("Refresh Dashboard", "np:home:refresh", "refresh"),
+                    make_button("Refresh Dashboard", "np:home:refresh", "refresh", style="primary"),
                 ],
             ]
         )
 
     def _cancel_kb(self, back: str = "np:home") -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
-            [[make_button("Cancel", f"np:cancel:{back}", "cancel")]]
+            [[make_button("Cancel", f"np:cancel:{back}", "cancel", style="danger")]]
         )
 
-    # -- Dashboard Rendering --
+    # -- Dashboard Rendering (Redis-Cached) --
 
     async def _build_dashboard(
-        self, owner_user_id: int, first_name: str | None = None
+        self, owner_user_id: int, first_name: str | None = None, *, force_refresh: bool = False
     ) -> tuple[RichText, InlineKeyboardMarkup]:
-        bot_user = await self.db.get_bot_user(owner_user_id) or {"max_accounts": 1}
-        accounts = await self.db.get_owner_accounts(owner_user_id)
-        acc = accounts[0] if accounts else None
+        if force_refresh:
+            await self.cache.invalidate_user_cache(owner_user_id)
+
+        dash = None if force_refresh else await self.cache.get_user_cache(owner_user_id, "dashboard")
+        if not isinstance(dash, dict):
+            bot_user, accounts = await self._get_owner_profile(owner_user_id)
+            acc = accounts[0] if accounts else None
+            max_acc = int(bot_user.get("max_accounts", 1))
+            if acc:
+                uid = int(acc["telegram_user_id"])
+                live = uid in self.manager.active_clients
+                running_cmps = sum(
+                    1
+                    for o, t in self.manager._campaign_tasks.values()
+                    if o == uid and not t.done()
+                )
+                tpls = await self._get_cached_templates(owner_user_id, uid)
+                scheds = await self._get_cached_schedules(owner_user_id, uid)
+                dash = {
+                    "connected": True,
+                    "uid": uid,
+                    "username": acc.get("username"),
+                    "live": live,
+                    "slots_used": len(accounts),
+                    "max_accounts": max_acc,
+                    "running_campaigns": running_cmps,
+                    "templates_count": len(tpls),
+                    "schedules_count": len(scheds),
+                }
+            else:
+                dash = {
+                    "connected": False,
+                    "slots_used": 0,
+                    "max_accounts": max_acc,
+                }
+            await self.cache.set_user_cache(owner_user_id, "dashboard", dash)
 
         r = RichText()
         r.line("NexaPilot Control Panel", icon="brand")
@@ -361,26 +506,25 @@ class NexaPilotBot:
         if first_name:
             r.line(f"Welcome, {first_name}!", icon="spark")
 
-        if acc:
-            uid = int(acc["telegram_user_id"])
+        if dash.get("connected"):
+            uid = int(dash["uid"])
             live = uid in self.manager.active_clients
-            uname = f"@{acc['username']}" if acc.get("username") else str(uid)
-            running_cmps = sum(
-                1
-                for o, t in self.manager._campaign_tasks.values()
-                if o == uid and not t.done()
-            )
+            uname = f"@{dash['username']}" if dash.get("username") else str(uid)
             r.line(
                 f"Account: {uname} ({'ONLINE' if live else 'OFFLINE'})",
                 icon="connected" if live else "disconnected",
             )
             r.line(
-                f"Slots Used: {len(accounts)}/{bot_user.get('max_accounts', 1)} | Running Campaigns: {running_cmps}",
+                f"Slots: {dash['slots_used']}/{dash['max_accounts']} | Running Campaigns: {dash.get('running_campaigns', 0)}",
                 icon="stat",
+            )
+            r.line(
+                f"Templates: {dash.get('templates_count', 0)} | Schedules: {dash.get('schedules_count', 0)}",
+                icon="tpl",
             )
         else:
             r.line(
-                f"Account: Not Connected (0/{bot_user.get('max_accounts', 1)})",
+                f"Account: Not Connected (0/{dash.get('max_accounts', 1)})",
                 icon="disconnected",
             )
             r.line("Tap 'My Account' below to connect your Telegram account.")
@@ -395,10 +539,10 @@ class NexaPilotBot:
         if not message.from_user:
             return
         owner_id = int(message.from_user.id)
-        self._states.pop(owner_id, None)
+        await self.cache.clear_fsm(owner_id)
         await self._ensure_bot_user(message.from_user)
         r, kb = await self._build_dashboard(owner_id, message.from_user.first_name)
-        await self._send_rich(message.chat.id, r, kb)
+        await self.send_ui(message.chat.id, r, kb)
 
     # -- Callback Router --
 
@@ -416,14 +560,22 @@ class NexaPilotBot:
 
         try:
             if data.startswith("np:cancel:"):
-                self._states.pop(owner_id, None)
+                await self.cache.clear_fsm(owner_id)
                 await self._cleanup_login(owner_id)
                 data = data.split("np:cancel:", 1)[1] or "np:home"
 
-            if data in ("np:home", "np:home:refresh"):
-                self._states.pop(owner_id, None)
+            if data == "np:home":
+                await self.cache.clear_fsm(owner_id)
                 r, kb = await self._build_dashboard(owner_id, cq.from_user.first_name)
-                await self._edit_rich(cq, r, kb)
+                await self.edit_ui(cq, r, kb)
+                return
+
+            if data == "np:home:refresh":
+                await self.cache.clear_fsm(owner_id)
+                r, kb = await self._build_dashboard(
+                    owner_id, cq.from_user.first_name, force_refresh=True
+                )
+                await self.edit_ui(cq, r, kb)
                 return
 
             # ---- Account Section ----
@@ -453,12 +605,12 @@ class NexaPilotBot:
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
                     return
-                self._states[owner_id] = {"flow": "tpl_new"}
+                await self.cache.set_fsm(owner_id, {"flow": "tpl_new"})
                 r = RichText()
                 r.line("Create New Template", icon="tpl")
                 r.line("Send your message with any Telegram Premium Custom Emojis and formatting.")
                 r.line("NexaPilot will extract every custom_emoji_id automatically.")
-                await self._edit_rich(cq, r, self._cancel_kb("np:tpl"))
+                await self.edit_ui(cq, r, self._cancel_kb("np:tpl"))
             elif data.startswith("np:tpl:prev:"):
                 await self._preview_template(cq, owner_id, data.split(":")[-1])
             elif data.startswith("np:tpl:del_ok:"):
@@ -468,6 +620,9 @@ class NexaPilotBot:
 
             # ---- Campaigns Section ----
             elif data == "np:cmp":
+                await self._view_campaigns_menu(cq, owner_id)
+            elif data == "np:cmp:refresh":
+                await self.cache.invalidate_user_cache(owner_id, ("campaigns", "dashboard"))
                 await self._view_campaigns_menu(cq, owner_id)
             elif data == "np:cmp:new":
                 await self._start_campaign_wizard(cq, owner_id)
@@ -527,26 +682,26 @@ class NexaPilotBot:
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
                     return
-                self._states[owner_id] = {"flow": "offline_cd"}
+                await self.cache.set_fsm(owner_id, {"flow": "offline_cd"})
                 r = RichText()
                 r.line("Set Offline Cooldown", icon="sched")
                 r.line(
                     f"Send cooldown in seconds ({MIN_OFFLINE_COOLDOWN_SECONDS}–{MAX_OFFLINE_COOLDOWN_SECONDS}, e.g. 300):"
                 )
-                await self._edit_rich(cq, r, self._cancel_kb("np:offline"))
+                await self.edit_ui(cq, r, self._cancel_kb("np:offline"))
             elif data == "np:kw":
                 await self._view_keywords_menu(cq, owner_id)
             elif data == "np:kw:new":
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
                     return
-                self._states[owner_id] = {"flow": "kw_new"}
+                await self.cache.set_fsm(owner_id, {"flow": "kw_new"})
                 r = RichText()
                 r.line("Add Keyword Auto-Reply", icon="auto")
                 r.line("Send in format:")
                 r.line("keyword | TEMPLATE_ID")
                 r.line("OR: keyword | Your custom reply with Premium Emojis")
-                await self._edit_rich(cq, r, self._cancel_kb("np:kw"))
+                await self.edit_ui(cq, r, self._cancel_kb("np:kw"))
             elif data.startswith("np:kw:del:"):
                 await self._delete_keyword_by_id(cq, owner_id, int(data.split(":")[-1]))
 
@@ -557,39 +712,38 @@ class NexaPilotBot:
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
                     return
-                self._states[owner_id] = {"flow": "sched_once"}
+                await self.cache.set_fsm(owner_id, {"flow": "sched_once"})
                 r = RichText()
                 r.line("New One-Time Scheduled Post", icon="sched")
                 r.line(f"Timezone: {self.manager.tz.key}")
                 r.line("Send in format:")
                 r.line("TEMPLATE_ID CHAT_ID YYYY-MM-DD HH:MM")
                 r.line("Example: TPL-4F9A2B -1001234567890 2026-12-01 18:30")
-                await self._edit_rich(cq, r, self._cancel_kb("np:sched"))
+                await self.edit_ui(cq, r, self._cancel_kb("np:sched"))
             elif data == "np:sched:every":
                 acc = await self._require_account(owner_id, cq=cq)
                 if not acc:
                     return
-                self._states[owner_id] = {"flow": "sched_every"}
+                await self.cache.set_fsm(owner_id, {"flow": "sched_every"})
                 r = RichText()
                 r.line("New Recurring Scheduled Post", icon="sched")
                 r.line("Send in format:")
                 r.line("TEMPLATE_ID CHAT_ID MINUTES")
                 r.line("Example: TPL-4F9A2B -1001234567890 60")
-                await self._edit_rich(cq, r, self._cancel_kb("np:sched"))
+                await self.edit_ui(cq, r, self._cancel_kb("np:sched"))
             elif data.startswith("np:sched:del:"):
                 await self._cancel_schedule(cq, owner_id, int(data.split(":")[-1]))
 
         except Exception as exc:
             logger.exception("Callback error (%s) for owner=%s: %s", data, owner_id, exc)
             r = RichText().line(f"Action failed: {exc}", icon="err")
-            await self._send_rich(cq.message.chat.id, r, self._main_menu_kb())
+            await self.send_ui(cq.message.chat.id, r, self._main_menu_kb())
 
     # -- Account Views, Ping & Real Telegram Logout --
 
     async def _check_account_limit(self, cq: CallbackQuery, owner_user_id: int) -> bool:
-        bot_user = await self.db.get_bot_user(owner_user_id) or {"max_accounts": 1}
+        bot_user, accounts = await self._get_owner_profile(owner_user_id)
         max_acc = int(bot_user.get("max_accounts", 1))
-        accounts = await self.db.get_owner_accounts(owner_user_id)
         if len(accounts) >= max_acc:
             r = RichText()
             r.line("Account Limit Reached", icon="lock")
@@ -597,17 +751,16 @@ class NexaPilotBot:
             r.line("Disconnect & Logout your current account first to connect a different one.")
             kb = InlineKeyboardMarkup(
                 [
-                    [make_button("My Account", "np:acc", "my_account")],
-                    [make_button("Main Menu", "np:home", "home")],
+                    [make_button("My Account", "np:acc", "my_account", style="primary")],
+                    [make_button("Main Menu", "np:home", "home", style="primary")],
                 ]
             )
-            await self._edit_rich(cq, r, kb)
+            await self.edit_ui(cq, r, kb)
             return False
         return True
 
     async def _view_account_menu(self, cq: CallbackQuery, owner_id: int) -> None:
-        bot_user = await self.db.get_bot_user(owner_id) or {"max_accounts": 1}
-        accounts = await self.db.get_owner_accounts(owner_id)
+        bot_user, accounts = await self._get_owner_profile(owner_id)
         acc = accounts[0] if accounts else None
 
         r = RichText()
@@ -625,11 +778,11 @@ class NexaPilotBot:
             kb = InlineKeyboardMarkup(
                 [
                     [
-                        make_button("Health & Ping", "np:acc:ping", "ping"),
-                        make_button("Disconnect & Logout", "np:acc:disc", "disconnect_logout"),
+                        make_button("Health & Ping", "np:acc:ping", "ping", style="primary"),
+                        make_button("Disconnect & Logout", "np:acc:disc", "disconnect_logout", style="danger"),
                     ],
-                    [make_button("Add Account", "np:acc:otp", "connect_otp")],
-                    [make_button("Main Menu", "np:home", "home")],
+                    [make_button("Add Account", "np:acc:otp", "connect_otp", style="success")],
+                    [make_button("Main Menu", "np:home", "home", style="primary")],
                 ]
             )
         else:
@@ -637,12 +790,12 @@ class NexaPilotBot:
             r.line("Choose how you want to connect your Telegram account:")
             kb = InlineKeyboardMarkup(
                 [
-                    [make_button("Login with Phone & OTP", "np:acc:otp", "connect_otp")],
-                    [make_button("Connect with Session String", "np:acc:str", "connect_string")],
-                    [make_button("Main Menu", "np:home", "home")],
+                    [make_button("Login with Phone & OTP", "np:acc:otp", "connect_otp", style="success")],
+                    [make_button("Connect with Session String", "np:acc:str", "connect_string", style="success")],
+                    [make_button("Main Menu", "np:home", "home", style="primary")],
                 ]
             )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _run_account_ping(self, cq: CallbackQuery, owner_id: int) -> None:
         acc = await self._require_account(owner_id, cq=cq)
@@ -650,9 +803,9 @@ class NexaPilotBot:
             return
         uid = int(acc["telegram_user_id"])
         uclient = self.manager.active_clients.get(uid)
-        tpls = await self.db.list_templates(uid)
-        scheds = await self.db.list_active_scheduled_posts(uid)
-        cmps = await self.db.list_campaigns(uid)
+        tpls = await self._get_cached_templates(owner_id, uid)
+        scheds = await self._get_cached_schedules(owner_id, uid)
+        cmps = await self._get_cached_campaigns(owner_id, uid)
         run_cmps = sum(1 for c in cmps if c.get("status") == "running")
 
         r = RichText()
@@ -675,33 +828,33 @@ class NexaPilotBot:
         )
         kb = InlineKeyboardMarkup(
             [
-                [make_button("Ping Again", "np:acc:ping", "refresh")],
+                [make_button("Ping Again", "np:acc:ping", "refresh", style="primary")],
                 [
-                    make_button("My Account", "np:acc", "my_account"),
-                    make_button("Main Menu", "np:home", "home"),
+                    make_button("My Account", "np:acc", "my_account", style="primary"),
+                    make_button("Main Menu", "np:home", "home", style="primary"),
                 ],
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _start_otp_login(self, cq: CallbackQuery, owner_id: int) -> None:
         if not await self._check_account_limit(cq, owner_id):
             return
         await self._cleanup_login(owner_id)
-        self._states[owner_id] = {"flow": "login_phone"}
+        await self.cache.set_fsm(owner_id, {"flow": "login_phone"})
         r = RichText()
         r.line("Connect Account — Step 1", icon="acc")
         r.line("Send your phone number with country code (e.g. +8801700000000):")
-        await self._edit_rich(cq, r, self._cancel_kb("np:acc"))
+        await self.edit_ui(cq, r, self._cancel_kb("np:acc"))
 
     async def _resend_otp_login(self, cq: CallbackQuery, owner_id: int) -> None:
         entry = self._pending_logins.get(owner_id)
         if not entry:
             r = RichText().line("Login session expired. Please start again.", icon="warn")
-            await self._edit_rich(
+            await self.edit_ui(
                 cq,
                 r,
-                InlineKeyboardMarkup([[make_button("Try Again", "np:acc:otp", "connect_otp")]]),
+                InlineKeyboardMarkup([[make_button("Try Again", "np:acc:otp", "connect_otp", style="success")]]),
             )
             return
         try:
@@ -712,20 +865,20 @@ class NexaPilotBot:
             r = RichText()
             r.line(f"OTP Resent! Delivery: {delivery}", icon="ok")
             r.line("Send the OTP code you received:")
-            await self._edit_rich(cq, r, self._cancel_kb("np:acc"))
+            await self.edit_ui(cq, r, self._cancel_kb("np:acc"))
         except Exception as exc:
             r = RichText().line(f"Resend failed: {exc}", icon="err")
-            await self._edit_rich(cq, r, self._cancel_kb("np:acc"))
+            await self.edit_ui(cq, r, self._cancel_kb("np:acc"))
 
     async def _start_session_string_login(self, cq: CallbackQuery, owner_id: int) -> None:
         if not await self._check_account_limit(cq, owner_id):
             return
-        self._states[owner_id] = {"flow": "login_session_string"}
+        await self.cache.set_fsm(owner_id, {"flow": "login_session_string"})
         r = RichText()
         r.line("Connect via Session String", icon="lock")
         r.line("Paste your Pyrogram / Kurigram session_string below.")
         r.line("Your message will be deleted immediately after saving for security.")
-        await self._edit_rich(cq, r, self._cancel_kb("np:acc"))
+        await self.edit_ui(cq, r, self._cancel_kb("np:acc"))
 
     async def _confirm_disconnect_account(self, cq: CallbackQuery, owner_id: int) -> None:
         acc = await self._require_account(owner_id, cq=cq)
@@ -743,24 +896,25 @@ class NexaPilotBot:
         kb = InlineKeyboardMarkup(
             [
                 [
-                    make_button("Confirm Logout", "np:acc:disc_ok", "confirm"),
-                    make_button("Cancel", "np:acc", "cancel"),
+                    make_button("Confirm Logout", "np:acc:disc_ok", "confirm", style="danger"),
+                    make_button("Cancel", "np:acc", "cancel", style="primary"),
                 ]
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _execute_disconnect_account(self, cq: CallbackQuery, owner_id: int) -> None:
         acc = await self._require_account(owner_id, cq=cq)
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
-        await self._edit_rich(
+        await self.edit_ui(
             cq,
             RichText().line("Logging out from Telegram & stopping all jobs...", icon="loading"),
         )
         logged_out = await self.manager.logout_and_disconnect_client(uid)
         await self.db.deactivate_owner_account(owner_id, uid)
+        await self.cache.invalidate_user_cache(owner_id)
 
         bot_user = await self.db.get_bot_user(owner_id) or {"max_accounts": 1}
         r = RichText()
@@ -778,11 +932,11 @@ class NexaPilotBot:
         r.line("You can now connect a different account anytime.")
         kb = InlineKeyboardMarkup(
             [
-                [make_button("Connect Account", "np:acc", "connect_otp")],
-                [make_button("Main Menu", "np:home", "home")],
+                [make_button("Connect Account", "np:acc", "connect_otp", style="success")],
+                [make_button("Main Menu", "np:home", "home", style="primary")],
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     # -- Status & Health --
 
@@ -792,16 +946,21 @@ class NexaPilotBot:
             return
         uid = int(acc["telegram_user_id"])
         live = uid in self.manager.active_clients
-        m_on, m_tpl = self.manager._mention_cache.get(uid, (False, None))
-        w_on, w_tpl = self.manager._welcome_cache.get(uid, (False, None))
-        o_on, o_mode, o_tpl, o_cd = self.manager._offline_cache.get(
-            uid, (False, "manual", None, DEFAULT_OFFLINE_COOLDOWN_SECONDS)
-        )
-        tpls = await self.db.list_templates(uid)
-        kws = await self.db.list_keyword_replies(uid)
-        scheds = await self.db.list_active_scheduled_posts(uid)
-        cmps = await self.db.list_campaigns(uid)
+        settings = await self._get_cached_settings(owner_id, uid)
+        tpls = await self._get_cached_templates(owner_id, uid)
+        scheds = await self._get_cached_schedules(owner_id, uid)
+        cmps = await self._get_cached_campaigns(owner_id, uid)
         run_cmps = sum(1 for c in cmps if c.get("status") == "running")
+
+        m_on = settings["mention_enabled"]
+        m_tpl = settings["mention_template_id"]
+        w_on = settings["welcome_enabled"]
+        w_tpl = settings["welcome_template_id"]
+        o_on = settings["offline_enabled"]
+        o_mode = settings["offline_mode"]
+        o_tpl = settings["offline_template_id"]
+        o_cd = settings["offline_cooldown_seconds"]
+        kws = settings["keyword_replies"]
 
         r = RichText()
         r.line("Account Status & Health", icon="stat")
@@ -811,6 +970,7 @@ class NexaPilotBot:
             icon="connected" if live else "disconnected",
         )
         r.line(f"Live Client: {'ONLINE' if live else 'OFFLINE'} | TZ: {self.manager.tz.key}")
+        r.line(f"Redis Fast-UI Cache: {'CONNECTED' if self.cache.is_connected else 'FALLBACK'}")
         r.line(f"Templates: {len(tpls)} | Keywords: {len(kws)} | Schedules: {len(scheds)}")
         r.line(f"Campaigns: {len(cmps)} total ({run_cmps} running)", icon="cmp")
         r.line(f"Mention: {'ON (' + str(m_tpl) + ')' if m_on else 'OFF'}")
@@ -822,13 +982,13 @@ class NexaPilotBot:
         kb = InlineKeyboardMarkup(
             [
                 [
-                    make_button("Live Ping", "np:acc:ping", "ping"),
-                    make_button("Refresh", "np:status", "refresh"),
+                    make_button("Live Ping", "np:acc:ping", "ping", style="primary"),
+                    make_button("Refresh", "np:status", "refresh", style="primary"),
                 ],
-                [make_button("Main Menu", "np:home", "home")],
+                [make_button("Main Menu", "np:home", "home", style="primary")],
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     # -- Templates (with Preview & 2-Step Delete Confirmation) --
 
@@ -837,12 +997,12 @@ class NexaPilotBot:
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
-        tpls = await self.db.list_templates(uid)
+        tpls = await self._get_cached_templates(owner_id, uid)
 
         r = RichText()
         r.line(f"Your Templates ({len(tpls)})", icon="tpl")
         rows: list[list[InlineKeyboardButton]] = [
-            [make_button("New Template", "np:tpl:new", "create_new")]
+            [make_button("New Template", "np:tpl:new", "create_new", style="success")]
         ]
         if not tpls:
             r.line("No templates yet. Tap 'New Template' to save one with Premium Custom Emojis.")
@@ -853,12 +1013,12 @@ class NexaPilotBot:
                 r.line(f"• {t['id']} (Emojis: {ecnt}) — {prev}")
                 rows.append(
                     [
-                        make_button(f"Preview {t['id']}", f"np:tpl:prev:{t['id']}", "preview"),
-                        make_button("Delete", f"np:tpl:del:{t['id']}", "delete"),
+                        make_button(f"Preview {t['id']}", f"np:tpl:prev:{t['id']}", "preview", style="primary"),
+                        make_button("Delete", f"np:tpl:del:{t['id']}", "delete", style="danger"),
                     ]
                 )
-        rows.append([make_button("Main Menu", "np:home", "home")])
-        await self._edit_rich(cq, r, InlineKeyboardMarkup(rows))
+        rows.append([make_button("Main Menu", "np:home", "home", style="primary")])
+        await self.edit_ui(cq, r, InlineKeyboardMarkup(rows))
 
     async def _preview_template(self, cq: CallbackQuery, owner_id: int, tpl_id: str) -> None:
         acc = await self._require_account(owner_id, cq=cq)
@@ -896,12 +1056,12 @@ class NexaPilotBot:
         kb = InlineKeyboardMarkup(
             [
                 [
-                    make_button("Confirm Delete", f"np:tpl:del_ok:{tpl_id}", "confirm"),
-                    make_button("Cancel", "np:tpl", "cancel"),
+                    make_button("Confirm Delete", f"np:tpl:del_ok:{tpl_id}", "confirm", style="danger"),
+                    make_button("Cancel", "np:tpl", "cancel", style="primary"),
                 ]
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _delete_template(self, cq: CallbackQuery, owner_id: int, tpl_id: str) -> None:
         acc = await self._require_account(owner_id, cq=cq)
@@ -910,6 +1070,7 @@ class NexaPilotBot:
         uid = int(acc["telegram_user_id"])
         await self.db.delete_template(uid, tpl_id)
         self.manager._template_cache.setdefault(uid, {}).pop(tpl_id.upper(), None)
+        await self.cache.invalidate_user_cache(owner_id, ("templates", "dashboard"))
         await self._view_templates_menu(cq, owner_id)
 
     # -- Campaigns (Quick Controls + Refresh + 2-Step Delete) --
@@ -919,14 +1080,14 @@ class NexaPilotBot:
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
-        cmps = await self.db.list_campaigns(uid)
+        cmps = await self._get_cached_campaigns(owner_id, uid)
 
         r = RichText()
         r.line(f"Your Campaigns ({len(cmps)})", icon="cmp")
         rows: list[list[InlineKeyboardButton]] = [
             [
-                make_button("New Campaign", "np:cmp:new", "create_new"),
-                make_button("Scan Groups", "np:cmp:scan", "scan_groups"),
+                make_button("New Campaign", "np:cmp:new", "create_new", style="success"),
+                make_button("Scan Groups", "np:cmp:scan", "scan_groups", style="primary"),
             ]
         ]
         if not cmps:
@@ -946,16 +1107,17 @@ class NexaPilotBot:
                             f"{c['id']} ({st}) — {c['name'][:20]}",
                             f"np:cmp:view:{c['id']}",
                             "manage",
+                            style="primary",
                         )
                     ]
                 )
         rows.append(
             [
-                make_button("Refresh", "np:cmp", "refresh"),
-                make_button("Main Menu", "np:home", "home"),
+                make_button("Refresh", "np:cmp:refresh", "refresh", style="primary"),
+                make_button("Main Menu", "np:home", "home", style="primary"),
             ]
         )
-        await self._edit_rich(cq, r, InlineKeyboardMarkup(rows))
+        await self.edit_ui(cq, r, InlineKeyboardMarkup(rows))
 
     async def _view_campaign_detail(
         self, cq: CallbackQuery, owner_id: int, cmp_id: str
@@ -991,28 +1153,28 @@ class NexaPilotBot:
 
         ctrl_row: list[InlineKeyboardButton] = []
         if st == "RUNNING":
-            ctrl_row.append(make_button("Pause", f"np:cmp:pause:{c['id']}", "pause"))
-            ctrl_row.append(make_button("Stop", f"np:cmp:stop:{c['id']}", "stop"))
-            ctrl_row.append(make_button("Block", f"np:cmp:block:{c['id']}", "block"))
+            ctrl_row.append(make_button("Pause", f"np:cmp:pause:{c['id']}", "pause", style="danger"))
+            ctrl_row.append(make_button("Stop", f"np:cmp:stop:{c['id']}", "stop", style="danger"))
+            ctrl_row.append(make_button("Block", f"np:cmp:block:{c['id']}", "block", style="danger"))
         elif st == "BLOCKED":
-            ctrl_row.append(make_button("Unblock", f"np:cmp:unblock:{c['id']}", "unblock"))
+            ctrl_row.append(make_button("Unblock", f"np:cmp:unblock:{c['id']}", "unblock", style="success"))
         else:
-            ctrl_row.append(make_button("Launch / Resume", f"np:cmp:start:{c['id']}", "launch_resume"))
-            ctrl_row.append(make_button("Block", f"np:cmp:block:{c['id']}", "block"))
+            ctrl_row.append(make_button("Launch / Resume", f"np:cmp:start:{c['id']}", "launch_resume", style="success"))
+            ctrl_row.append(make_button("Block", f"np:cmp:block:{c['id']}", "block", style="danger"))
 
         kb = InlineKeyboardMarkup(
             [
                 ctrl_row,
                 [
-                    make_button("Groups", f"np:cmp:groups:{c['id']}", "groups"),
-                    make_button("Rescan", f"np:cmp:rescan:{c['id']}", "rescan"),
-                    make_button("Refresh", f"np:cmp:view:{c['id']}", "refresh"),
+                    make_button("Groups", f"np:cmp:groups:{c['id']}", "groups", style="primary"),
+                    make_button("Rescan", f"np:cmp:rescan:{c['id']}", "rescan", style="primary"),
+                    make_button("Refresh", f"np:cmp:view:{c['id']}", "refresh", style="primary"),
                 ],
-                [make_button("Delete Campaign", f"np:cmp:del:{c['id']}", "delete")],
-                [make_button("Back to Campaigns", "np:cmp", "back")],
+                [make_button("Delete Campaign", f"np:cmp:del:{c['id']}", "delete", style="danger")],
+                [make_button("Back to Campaigns", "np:cmp", "back", style="primary")],
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _confirm_delete_campaign(
         self, cq: CallbackQuery, owner_id: int, cmp_id: str
@@ -1026,12 +1188,12 @@ class NexaPilotBot:
         kb = InlineKeyboardMarkup(
             [
                 [
-                    make_button("Confirm Delete", f"np:cmp:del_ok:{cmp_id}", "confirm"),
-                    make_button("Cancel", f"np:cmp:view:{cmp_id}", "cancel"),
+                    make_button("Confirm Delete", f"np:cmp:del_ok:{cmp_id}", "confirm", style="danger"),
+                    make_button("Cancel", f"np:cmp:view:{cmp_id}", "cancel", style="primary"),
                 ]
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _view_campaign_groups(
         self, cq: CallbackQuery, owner_id: int, cmp_id: str
@@ -1051,8 +1213,8 @@ class NexaPilotBot:
             r.line(f"{i}. {g['title']} ({tag}) | {g['chat_id']}")
         if len(groups) > 25:
             r.line(f"...and {len(groups) - 25} more.")
-        kb = InlineKeyboardMarkup([[make_button("Back", f"np:cmp:view:{cmp_id}", "back")]])
-        await self._edit_rich(cq, r, kb)
+        kb = InlineKeyboardMarkup([[make_button("Back", f"np:cmp:view:{cmp_id}", "back", style="primary")]])
+        await self.edit_ui(cq, r, kb)
 
     async def _action_campaign(
         self, cq: CallbackQuery, owner_id: int, cmp_id: str, action: str
@@ -1095,9 +1257,11 @@ class NexaPilotBot:
         elif action == "del":
             await self.manager._cancel_campaign_task(cmp_id)
             await self.db.delete_campaign(cmp_id, uid)
+            await self.cache.invalidate_user_cache(owner_id, ("campaigns", "dashboard"))
             await self._view_campaigns_menu(cq, owner_id)
             return
 
+        await self.cache.invalidate_user_cache(owner_id, ("campaigns", "dashboard"))
         await self._view_campaign_detail(cq, owner_id, cmp_id)
 
     async def _run_scan_groups(self, cq: CallbackQuery, owner_id: int) -> None:
@@ -1108,12 +1272,12 @@ class NexaPilotBot:
         uclient = self.manager.active_clients.get(uid)
         if not uclient:
             r = RichText().line("Your userbot client is offline. Reconnect first.", icon="warn")
-            await self._edit_rich(
-                cq, r, InlineKeyboardMarkup([[make_button("Back", "np:cmp", "back")]])
+            await self.edit_ui(
+                cq, r, InlineKeyboardMarkup([[make_button("Back", "np:cmp", "back", style="primary")]])
             )
             return
 
-        await self._edit_rich(
+        await self.edit_ui(
             cq, RichText().line("Scanning public & private Buy/Sell groups...", icon="loading")
         )
         folders = await self.manager._get_telegram_folders(uclient)
@@ -1132,41 +1296,41 @@ class NexaPilotBot:
             r.line(f"...and {len(matched) - 20} more.")
         kb = InlineKeyboardMarkup(
             [
-                [make_button("Create Campaign Now", "np:cmp:new", "create_new")],
-                [make_button("Back", "np:cmp", "back")],
+                [make_button("Create Campaign Now", "np:cmp:new", "create_new", style="success")],
+                [make_button("Back", "np:cmp", "back", style="primary")],
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _start_campaign_wizard(self, cq: CallbackQuery, owner_id: int) -> None:
         acc = await self._require_account(owner_id, cq=cq)
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
-        tpls = await self.db.list_templates(uid)
+        tpls = await self._get_cached_templates(owner_id, uid)
         if not tpls:
             r = RichText()
             r.line("Create a Template First", icon="warn")
             r.line("You need at least 1 template before creating a campaign.")
             kb = InlineKeyboardMarkup(
                 [
-                    [make_button("Create Template", "np:tpl:new", "create_new")],
-                    [make_button("Back", "np:cmp", "back")],
+                    [make_button("Create Template", "np:tpl:new", "create_new", style="success")],
+                    [make_button("Back", "np:cmp", "back", style="primary")],
                 ]
             )
-            await self._edit_rich(cq, r, kb)
+            await self.edit_ui(cq, r, kb)
             return
 
-        self._states[owner_id] = {"flow": "cmp_wiz", "step": "name", "data": {}}
+        await self.cache.set_fsm(owner_id, {"flow": "cmp_wiz", "step": "name", "data": {}})
         r = RichText()
         r.line("New Campaign — Step 1/6", icon="cmp")
         r.line("Send a name for this campaign (e.g. BuySell Promo 1):")
-        await self._edit_rich(cq, r, self._cancel_kb("np:cmp"))
+        await self.edit_ui(cq, r, self._cancel_kb("np:cmp"))
 
     async def _wizard_pick_mode(
         self, cq: CallbackQuery, owner_id: int, mode: str
     ) -> None:
-        st = self._states.get(owner_id)
+        st = await self.cache.get_fsm(owner_id)
         if not st or st.get("flow") != "cmp_wiz":
             return
         acc = await self._require_account(owner_id, cq=cq)
@@ -1185,36 +1349,39 @@ class NexaPilotBot:
                     "No Telegram Folders found on your account. Pick Buy & Sell or Custom Keywords.",
                     icon="warn",
                 )
-                await self._edit_rich(cq, r, self._cancel_kb("np:cmp"))
+                await self.edit_ui(cq, r, self._cancel_kb("np:cmp"))
                 return
-            st["folders"] = folders
+            st["folders"] = [{"title": f["title"]} for f in folders[:12]]
+            await self.cache.set_fsm(owner_id, st)
             rows = [
-                [make_button(f["title"], f"np:cmp:folder:{idx}", "folder")]
-                for idx, f in enumerate(folders[:12])
+                [make_button(f["title"], f"np:cmp:folder:{idx}", "folder", style="primary")]
+                for idx, f in enumerate(st["folders"])
             ]
-            rows.append([make_button("Cancel", "np:cancel:np:cmp", "cancel")])
+            rows.append([make_button("Cancel", "np:cancel:np:cmp", "cancel", style="danger")])
             r = RichText().line("Step 3b — Select Telegram Folder:", icon="cmp")
-            await self._edit_rich(cq, r, InlineKeyboardMarkup(rows))
+            await self.edit_ui(cq, r, InlineKeyboardMarkup(rows))
             return
 
         if mode == "keywords":
             st["step"] = "keywords"
+            await self.cache.set_fsm(owner_id, st)
             r = RichText()
             r.line("Step 3b — Custom Keywords", icon="cmp")
             r.line("Send comma-separated English keywords (e.g. buy, sell, crypto, market):")
-            await self._edit_rich(cq, r, self._cancel_kb("np:cmp"))
+            await self.edit_ui(cq, r, self._cancel_kb("np:cmp"))
             return
 
         st["step"] = "max_groups"
+        await self.cache.set_fsm(owner_id, st)
         r = RichText()
         r.line("Step 4/6 — Max Group Limit", icon="cmp")
         r.line("Send max number of groups (e.g. 20), or 0 for all matched groups:")
-        await self._edit_rich(cq, r, self._cancel_kb("np:cmp"))
+        await self.edit_ui(cq, r, self._cancel_kb("np:cmp"))
 
     async def _wizard_pick_folder(
         self, cq: CallbackQuery, owner_id: int, idx: int
     ) -> None:
-        st = self._states.get(owner_id)
+        st = await self.cache.get_fsm(owner_id)
         if not st or st.get("flow") != "cmp_wiz":
             return
         folders = st.get("folders") or []
@@ -1222,11 +1389,12 @@ class NexaPilotBot:
             return
         st["data"]["folder_name"] = folders[idx]["title"]
         st["step"] = "max_groups"
+        await self.cache.set_fsm(owner_id, st)
         r = RichText()
         r.line(f"Selected Folder: {folders[idx]['title']}", icon="ok")
         r.line("Step 4/6 — Max Group Limit")
         r.line("Send max number of groups (e.g. 20), or 0 for all matched groups:")
-        await self._edit_rich(cq, r, self._cancel_kb("np:cmp"))
+        await self.edit_ui(cq, r, self._cancel_kb("np:cmp"))
 
     # -- Auto-Replies (Mention, Welcome, Offline, Keywords) --
 
@@ -1240,17 +1408,17 @@ class NexaPilotBot:
         kb = InlineKeyboardMarkup(
             [
                 [
-                    make_button("Mention Reply", "np:mention", "mention"),
-                    make_button("Welcome DM", "np:welcome", "welcome"),
+                    make_button("Mention Reply", "np:mention", "mention", style="primary"),
+                    make_button("Welcome DM", "np:welcome", "welcome", style="primary"),
                 ],
                 [
-                    make_button("Offline / Away", "np:offline", "offline"),
-                    make_button("Keyword Rules", "np:kw", "keywords"),
+                    make_button("Offline / Away", "np:offline", "offline", style="primary"),
+                    make_button("Keyword Rules", "np:kw", "keywords", style="primary"),
                 ],
-                [make_button("Main Menu", "np:home", "home")],
+                [make_button("Main Menu", "np:home", "home", style="primary")],
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _prompt_set_auto(
         self, cq: CallbackQuery, owner_id: int, flow: str, title: str
@@ -1258,20 +1426,22 @@ class NexaPilotBot:
         acc = await self._require_account(owner_id, cq=cq)
         if not acc:
             return
-        self._states[owner_id] = {"flow": flow}
+        await self.cache.set_fsm(owner_id, {"flow": flow})
         r = RichText()
         r.line(f"Set {title}", icon="auto")
         r.line(
             "Send a saved Template ID (e.g. TPL-4F9A2B), OR send any custom message with Premium Custom Emojis directly."
         )
-        await self._edit_rich(cq, r, self._cancel_kb("np:auto"))
+        await self.edit_ui(cq, r, self._cancel_kb("np:auto"))
 
     async def _view_mention_menu(self, cq: CallbackQuery, owner_id: int) -> None:
         acc = await self._require_account(owner_id, cq=cq)
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
-        enabled, tpl_id = self.manager._mention_cache.get(uid, (False, None))
+        settings = await self._get_cached_settings(owner_id, uid)
+        enabled = settings["mention_enabled"]
+        tpl_id = settings["mention_template_id"]
         r = RichText()
         r.line("Mention Auto-Reply", icon="auto")
         r.line(
@@ -1281,17 +1451,18 @@ class NexaPilotBot:
         kb = InlineKeyboardMarkup(
             [
                 [
-                    make_button("Set Message", "np:mention:set", "manage"),
+                    make_button("Set Message", "np:mention:set", "manage", style="primary"),
                     make_button(
                         "Turn OFF" if enabled else "Turn ON",
                         "np:mention:toggle",
                         "toggle_off" if enabled else "toggle_on",
+                        style="danger" if enabled else "success",
                     ),
                 ],
-                [make_button("Back", "np:auto", "back")],
+                [make_button("Back", "np:auto", "back", style="primary")],
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _toggle_mention(self, cq: CallbackQuery, owner_id: int) -> None:
         acc = await self._require_account(owner_id, cq=cq)
@@ -1305,6 +1476,7 @@ class NexaPilotBot:
         new_state = not enabled
         await self.db.set_mention_config(uid, enabled=new_state)
         self.manager._mention_cache[uid] = (new_state, tpl_id)
+        await self.cache.invalidate_user_cache(owner_id, ("settings", "dashboard"))
         await self._view_mention_menu(cq, owner_id)
 
     async def _view_welcome_menu(self, cq: CallbackQuery, owner_id: int) -> None:
@@ -1312,7 +1484,9 @@ class NexaPilotBot:
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
-        enabled, tpl_id = self.manager._welcome_cache.get(uid, (False, None))
+        settings = await self._get_cached_settings(owner_id, uid)
+        enabled = settings["welcome_enabled"]
+        tpl_id = settings["welcome_template_id"]
         cnt = len(self.manager._welcomed_users_cache.get(uid, set()))
         r = RichText()
         r.line("Welcome DM Auto-Reply", icon="spark")
@@ -1324,18 +1498,19 @@ class NexaPilotBot:
         kb = InlineKeyboardMarkup(
             [
                 [
-                    make_button("Set Message", "np:welcome:set", "manage"),
+                    make_button("Set Message", "np:welcome:set", "manage", style="primary"),
                     make_button(
                         "Turn OFF" if enabled else "Turn ON",
                         "np:welcome:toggle",
                         "toggle_off" if enabled else "toggle_on",
+                        style="danger" if enabled else "success",
                     ),
                 ],
-                [make_button("Reset Welcomed List", "np:welcome:reset", "reset")],
-                [make_button("Back", "np:auto", "back")],
+                [make_button("Reset Welcomed List", "np:welcome:reset", "reset", style="danger")],
+                [make_button("Back", "np:auto", "back", style="primary")],
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _toggle_welcome(self, cq: CallbackQuery, owner_id: int) -> None:
         acc = await self._require_account(owner_id, cq=cq)
@@ -1349,6 +1524,7 @@ class NexaPilotBot:
         new_state = not enabled
         await self.db.set_welcome_config(uid, enabled=new_state)
         self.manager._welcome_cache[uid] = (new_state, tpl_id)
+        await self.cache.invalidate_user_cache(owner_id, ("settings", "dashboard"))
         await self._view_welcome_menu(cq, owner_id)
 
     async def _reset_welcome(self, cq: CallbackQuery, owner_id: int) -> None:
@@ -1358,6 +1534,7 @@ class NexaPilotBot:
         uid = int(acc["telegram_user_id"])
         await self.db.reset_welcomed_users(uid)
         self.manager._welcomed_users_cache[uid] = set()
+        await self.cache.invalidate_user_cache(owner_id, ("settings", "dashboard"))
         await self._view_welcome_menu(cq, owner_id)
 
     async def _view_offline_menu(self, cq: CallbackQuery, owner_id: int) -> None:
@@ -1365,9 +1542,11 @@ class NexaPilotBot:
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
-        enabled, mode, tpl_id, cd = self.manager._offline_cache.get(
-            uid, (False, "manual", None, DEFAULT_OFFLINE_COOLDOWN_SECONDS)
-        )
+        settings = await self._get_cached_settings(owner_id, uid)
+        enabled = settings["offline_enabled"]
+        mode = settings["offline_mode"]
+        tpl_id = settings["offline_template_id"]
+        cd = settings["offline_cooldown_seconds"]
         r = RichText()
         r.line("Offline / Away DM Auto-Reply", icon="auto")
         r.line(
@@ -1378,11 +1557,12 @@ class NexaPilotBot:
         kb = InlineKeyboardMarkup(
             [
                 [
-                    make_button("Set Message", "np:offline:set", "manage"),
+                    make_button("Set Message", "np:offline:set", "manage", style="primary"),
                     make_button(
                         "Turn OFF" if enabled else "Turn ON",
                         "np:offline:toggle",
                         "toggle_off" if enabled else "toggle_on",
+                        style="danger" if enabled else "success",
                     ),
                 ],
                 [
@@ -1390,13 +1570,14 @@ class NexaPilotBot:
                         "Switch to AUTO" if mode == "manual" else "Switch to MANUAL",
                         "np:offline:mode",
                         "mode",
+                        style="primary",
                     ),
-                    make_button("Set Cooldown", "np:offline:cd", "cooldown"),
+                    make_button("Set Cooldown", "np:offline:cd", "cooldown", style="primary"),
                 ],
-                [make_button("Back", "np:auto", "back")],
+                [make_button("Back", "np:auto", "back", style="primary")],
             ]
         )
-        await self._edit_rich(cq, r, kb)
+        await self.edit_ui(cq, r, kb)
 
     async def _toggle_offline(self, cq: CallbackQuery, owner_id: int) -> None:
         acc = await self._require_account(owner_id, cq=cq)
@@ -1412,6 +1593,7 @@ class NexaPilotBot:
         new_state = not enabled
         await self.db.set_offline_config(uid, enabled=new_state)
         self.manager._offline_cache[uid] = (new_state, mode, tpl_id, cd)
+        await self.cache.invalidate_user_cache(owner_id, ("settings", "dashboard"))
         await self._view_offline_menu(cq, owner_id)
 
     async def _switch_offline_mode(self, cq: CallbackQuery, owner_id: int) -> None:
@@ -1425,6 +1607,7 @@ class NexaPilotBot:
         new_mode = "auto" if mode == "manual" else "manual"
         await self.db.set_offline_config(uid, mode=new_mode)
         self.manager._offline_cache[uid] = (enabled, new_mode, tpl_id, cd)
+        await self.cache.invalidate_user_cache(owner_id, ("settings", "dashboard"))
         await self._view_offline_menu(cq, owner_id)
 
     async def _view_keywords_menu(self, cq: CallbackQuery, owner_id: int) -> None:
@@ -1432,11 +1615,12 @@ class NexaPilotBot:
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
-        rules = await self.db.list_keyword_replies(uid)
+        settings = await self._get_cached_settings(owner_id, uid)
+        rules = settings["keyword_replies"]
         r = RichText()
         r.line(f"Keyword Auto-Replies ({len(rules)})", icon="auto")
         rows: list[list[InlineKeyboardButton]] = [
-            [make_button("Add Keyword Rule", "np:kw:new", "create_new")]
+            [make_button("Add Keyword Rule", "np:kw:new", "create_new", style="success")]
         ]
         if not rules:
             r.line("No keyword rules configured yet.")
@@ -1449,11 +1633,12 @@ class NexaPilotBot:
                             f"Delete \"{rule['trigger_text'][:20]}\"",
                             f"np:kw:del:{rule['id']}",
                             "delete",
+                            style="danger",
                         )
                     ]
                 )
-        rows.append([make_button("Back", "np:auto", "back")])
-        await self._edit_rich(cq, r, InlineKeyboardMarkup(rows))
+        rows.append([make_button("Back", "np:auto", "back", style="primary")])
+        await self.edit_ui(cq, r, InlineKeyboardMarkup(rows))
 
     async def _delete_keyword_by_id(
         self, cq: CallbackQuery, owner_id: int, row_id: int
@@ -1467,6 +1652,7 @@ class NexaPilotBot:
         if match:
             await self.db.delete_keyword_reply(uid, match["trigger_text"])
             await self.manager.refresh_user_cache(uid)
+            await self.cache.invalidate_user_cache(owner_id, ("settings", "dashboard"))
         await self._view_keywords_menu(cq, owner_id)
 
     # -- Schedules --
@@ -1476,13 +1662,13 @@ class NexaPilotBot:
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
-        jobs = await self.db.list_active_scheduled_posts(uid)
+        jobs = await self._get_cached_schedules(owner_id, uid)
         r = RichText()
         r.line(f"Scheduled Posts ({len(jobs)})", icon="sched")
         rows: list[list[InlineKeyboardButton]] = [
             [
-                make_button("One-Time Post", "np:sched:once", "schedule_once"),
-                make_button("Recurring Post", "np:sched:every", "schedule_every"),
+                make_button("One-Time Post", "np:sched:once", "schedule_once", style="success"),
+                make_button("Recurring Post", "np:sched:every", "schedule_every", style="success"),
             ]
         ]
         if not jobs:
@@ -1496,10 +1682,10 @@ class NexaPilotBot:
                 )
                 r.line(f"• Job #{j['id']} | {j['template_id']} -> {j['target_chat_id']} ({timing})")
                 rows.append(
-                    [make_button(f"Cancel Job #{j['id']}", f"np:sched:del:{j['id']}", "delete")]
+                    [make_button(f"Cancel Job #{j['id']}", f"np:sched:del:{j['id']}", "delete", style="danger")]
                 )
-        rows.append([make_button("Main Menu", "np:home", "home")])
-        await self._edit_rich(cq, r, InlineKeyboardMarkup(rows))
+        rows.append([make_button("Main Menu", "np:home", "home", style="primary")])
+        await self.edit_ui(cq, r, InlineKeyboardMarkup(rows))
 
     async def _cancel_schedule(
         self, cq: CallbackQuery, owner_id: int, job_id: int
@@ -1512,15 +1698,16 @@ class NexaPilotBot:
         if self.manager.scheduler.get_job(sched_id):
             self.manager.scheduler.remove_job(sched_id)
         await self.db.delete_scheduled_post(job_id, uid)
+        await self.cache.invalidate_user_cache(owner_id, ("schedules", "dashboard"))
         await self._view_schedules_menu(cq, owner_id)
 
-    # -- Interactive Private Text Step Router --
+    # -- Interactive Private Text Step Router (Redis FSM) --
 
     async def _handle_private_text(self, _client: BotClient, message: BotMessage) -> None:
         if not message.from_user or not message.text:
             return
         owner_id = int(message.from_user.id)
-        state = self._states.get(owner_id)
+        state = await self.cache.get_fsm(owner_id)
         if not state:
             return
 
@@ -1557,8 +1744,8 @@ class NexaPilotBot:
                 await self._step_cmp_wizard(owner_id, chat_id, text, state)
         except Exception as exc:
             logger.exception("Interactive step '%s' failed for owner=%s: %s", flow, owner_id, exc)
-            self._states.pop(owner_id, None)
-            await self._send_rich(
+            await self.cache.clear_fsm(owner_id)
+            await self.send_ui(
                 chat_id,
                 RichText().line(f"Error: {exc}", icon="err"),
                 self._main_menu_kb(),
@@ -1582,7 +1769,7 @@ class NexaPilotBot:
             sent = await temp_client.send_code(phone)
         except (FloodWait, FloodPremiumWait) as exc:
             await temp_client.disconnect()
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line(f"Rate limited by Telegram. Wait {exc.value}s.", icon="warn"),
                 self._cancel_kb("np:acc"),
@@ -1596,7 +1783,7 @@ class NexaPilotBot:
             RPCError,
         ) as exc:
             await temp_client.disconnect()
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line(f"Could not send OTP: {exc}", icon="err"),
                 self._cancel_kb("np:acc"),
@@ -1609,18 +1796,18 @@ class NexaPilotBot:
             "hash": sent.phone_code_hash,
             "created_at": time.monotonic(),
         }
-        self._states[owner_id] = {"flow": "login_otp"}
+        await self.cache.set_fsm(owner_id, {"flow": "login_otp"})
         delivery = getattr(getattr(sent, "type", None), "name", "APP")
         r = RichText()
         r.line(f"OTP Sent! (Delivery: {delivery})", icon="ok")
         r.line("Enter the OTP code you received (e.g. 12345):")
         kb = InlineKeyboardMarkup(
             [
-                [make_button("Resend Code", "np:acc:resend", "resend")],
-                [make_button("Cancel", "np:cancel:np:acc", "cancel")],
+                [make_button("Resend Code", "np:acc:resend", "resend", style="primary")],
+                [make_button("Cancel", "np:cancel:np:acc", "cancel", style="danger")],
             ]
         )
-        await self._send_rich(chat_id, r, kb)
+        await self.send_ui(chat_id, r, kb)
 
     async def _finalize_bot_login(
         self, owner_id: int, chat_id: int, entry: dict[str, Any]
@@ -1636,7 +1823,7 @@ class NexaPilotBot:
             owner_user_id=owner_id,
         )
         await self._cleanup_login(owner_id)
-        self._states.pop(owner_id, None)
+        await self.cache.clear_fsm(owner_id)
         await self.manager.start_client(
             me.id,
             session_string,
@@ -1645,16 +1832,17 @@ class NexaPilotBot:
             source="user_sessions",
             username=me.username,
         )
+        await self.cache.invalidate_user_cache(owner_id)
         r = RichText()
         r.line(f"Account Connected! (@{me.username or me.id})", icon="connected")
         r.line("Your NexaPilot workspace is ready.")
-        await self._send_rich(chat_id, r, self._main_menu_kb())
+        await self.send_ui(chat_id, r, self._main_menu_kb())
 
     async def _step_login_otp(self, owner_id: int, chat_id: int, raw_code: str) -> None:
         entry = self._pending_logins.get(owner_id)
         if not entry:
-            self._states.pop(owner_id, None)
-            await self._send_rich(
+            await self.cache.clear_fsm(owner_id)
+            await self.send_ui(
                 chat_id,
                 RichText().line("Session expired. Start again.", icon="warn"),
                 self._main_menu_kb(),
@@ -1665,14 +1853,14 @@ class NexaPilotBot:
             await entry["client"].sign_in(entry["phone"], entry["hash"], code)
         except SessionPasswordNeeded:
             entry["created_at"] = time.monotonic()
-            self._states[owner_id] = {"flow": "login_2fa"}
+            await self.cache.set_fsm(owner_id, {"flow": "login_2fa"})
             r = RichText()
             r.line("2FA Password Required", icon="lock")
             r.line("Send your Telegram Two-Step Verification password:")
-            await self._send_rich(chat_id, r, self._cancel_kb("np:acc"))
+            await self.send_ui(chat_id, r, self._cancel_kb("np:acc"))
             return
         except (PhoneCodeInvalid, PhoneCodeEmpty):
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Invalid OTP code. Try again:", icon="err"),
                 self._cancel_kb("np:acc"),
@@ -1680,8 +1868,8 @@ class NexaPilotBot:
             return
         except PhoneCodeExpired:
             await self._cleanup_login(owner_id)
-            self._states.pop(owner_id, None)
-            await self._send_rich(
+            await self.cache.clear_fsm(owner_id)
+            await self.send_ui(
                 chat_id,
                 RichText().line("OTP expired. Request a new code.", icon="warn"),
                 self._main_menu_kb(),
@@ -1693,8 +1881,8 @@ class NexaPilotBot:
     async def _step_login_2fa(self, owner_id: int, chat_id: int, password: str) -> None:
         entry = self._pending_logins.get(owner_id)
         if not entry:
-            self._states.pop(owner_id, None)
-            await self._send_rich(
+            await self.cache.clear_fsm(owner_id)
+            await self.send_ui(
                 chat_id,
                 RichText().line("Session expired. Start again.", icon="warn"),
                 self._main_menu_kb(),
@@ -1703,7 +1891,7 @@ class NexaPilotBot:
         try:
             await entry["client"].check_password(password=password)
         except PasswordHashInvalid:
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Wrong 2FA password. Try again:", icon="err"),
                 self._cancel_kb("np:acc"),
@@ -1714,10 +1902,10 @@ class NexaPilotBot:
     async def _step_login_session_string(
         self, owner_id: int, chat_id: int, session_str: str
     ) -> None:
-        self._states.pop(owner_id, None)
+        await self.cache.clear_fsm(owner_id)
         s = session_str.strip()
         if len(s) < 50:
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Invalid session_string format.", icon="err"),
                 self._main_menu_kb(),
@@ -1733,7 +1921,7 @@ class NexaPilotBot:
                 await temp.stop()
             except Exception:
                 pass
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line(f"Invalid session_string: {exc}", icon="err"),
                 self._main_menu_kb(),
@@ -1756,23 +1944,24 @@ class NexaPilotBot:
             label="NexaPilot",
             username=me.username,
         )
+        await self.cache.invalidate_user_cache(owner_id)
         r = RichText()
         r.line(f"Session Connected! (@{me.username or me.id})", icon="connected")
-        await self._send_rich(chat_id, r, self._main_menu_kb())
+        await self.send_ui(chat_id, r, self._main_menu_kb())
 
     # -- Template, Auto-Reply, Keyword, Schedule & Campaign Wizard Steps --
 
     async def _step_tpl_new(
         self, owner_id: int, chat_id: int, message: BotMessage
     ) -> None:
-        self._states.pop(owner_id, None)
+        await self.cache.clear_fsm(owner_id)
         acc = await self._require_account(owner_id, chat_id=chat_id)
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
         payload, entities_json = serialize_bot_entities(message.text or "", message.entities)
         if not payload:
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Template text cannot be empty.", icon="err"),
                 self._main_menu_kb(),
@@ -1780,6 +1969,7 @@ class NexaPilotBot:
             return
         tpl = await self.db.create_template(uid, payload, entities_json)
         self.manager._template_cache.setdefault(uid, {})[tpl["id"]] = tpl
+        await self.cache.invalidate_user_cache(owner_id, ("templates", "dashboard"))
         cids = extract_custom_emoji_ids(entities_json)
 
         r = RichText()
@@ -1787,15 +1977,15 @@ class NexaPilotBot:
         r.line(f"Premium Custom Emojis Extracted: {len(cids)}", icon="spark")
         if cids:
             r.line(f"IDs: {', '.join(cids[:10])}")
-        await self._send_rich(
+        await self.send_ui(
             chat_id,
             r,
             InlineKeyboardMarkup(
                 [
-                    [make_button("Preview Template", f"np:tpl:prev:{tpl['id']}", "preview")],
+                    [make_button("Preview Template", f"np:tpl:prev:{tpl['id']}", "preview", style="primary")],
                     [
-                        make_button("My Templates", "np:tpl", "templates"),
-                        make_button("Main Menu", "np:home", "home"),
+                        make_button("My Templates", "np:tpl", "templates", style="primary"),
+                        make_button("Main Menu", "np:home", "home", style="primary"),
                     ],
                 ]
             ),
@@ -1804,7 +1994,7 @@ class NexaPilotBot:
     async def _step_set_auto(
         self, owner_id: int, chat_id: int, message: BotMessage, flow: str
     ) -> None:
-        self._states.pop(owner_id, None)
+        await self.cache.clear_fsm(owner_id)
         acc = await self._require_account(owner_id, chat_id=chat_id)
         if not acc:
             return
@@ -1815,7 +2005,7 @@ class NexaPilotBot:
         if TEMPLATE_ID_RE.match(cand):
             tpl = await self.db.get_template(uid, cand)
             if not tpl:
-                await self._send_rich(
+                await self.send_ui(
                     chat_id,
                     RichText().line(f"Template {cand} not found.", icon="err"),
                     self._main_menu_kb(),
@@ -1848,25 +2038,26 @@ class NexaPilotBot:
             back = "np:offline"
             label = "Offline / Away DM"
 
+        await self.cache.invalidate_user_cache(owner_id, ("settings", "templates", "dashboard"))
         r = RichText()
         r.line(f"{label} ENABLED!", icon="ok")
         r.line(
             f"Template: {tid} | Custom Emojis: {count_custom_emojis(tpl.get('entities_json'))}",
             icon="spark",
         )
-        await self._send_rich(
+        await self.send_ui(
             chat_id,
             r,
             InlineKeyboardMarkup(
                 [
-                    [make_button("Back", back, "back")],
-                    [make_button("Main Menu", "np:home", "home")],
+                    [make_button("Back", back, "back", style="primary")],
+                    [make_button("Main Menu", "np:home", "home", style="primary")],
                 ]
             ),
         )
 
     async def _step_offline_cd(self, owner_id: int, chat_id: int, text: str) -> None:
-        self._states.pop(owner_id, None)
+        await self.cache.clear_fsm(owner_id)
         acc = await self._require_account(owner_id, chat_id=chat_id)
         if not acc:
             return
@@ -1876,7 +2067,7 @@ class NexaPilotBot:
             if not (MIN_OFFLINE_COOLDOWN_SECONDS <= sec <= MAX_OFFLINE_COOLDOWN_SECONDS):
                 raise ValueError
         except ValueError:
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line(
                     f"Must be {MIN_OFFLINE_COOLDOWN_SECONDS}–{MAX_OFFLINE_COOLDOWN_SECONDS} seconds.",
@@ -1890,23 +2081,24 @@ class NexaPilotBot:
         )
         await self.db.set_offline_config(uid, cooldown_seconds=sec)
         self.manager._offline_cache[uid] = (enabled, mode, tpl_id, sec)
-        await self._send_rich(
+        await self.cache.invalidate_user_cache(owner_id, ("settings", "dashboard"))
+        await self.send_ui(
             chat_id,
             RichText().line(f"Offline cooldown set to {sec}s.", icon="ok"),
-            InlineKeyboardMarkup([[make_button("Offline Menu", "np:offline", "back")]]),
+            InlineKeyboardMarkup([[make_button("Offline Menu", "np:offline", "back", style="primary")]]),
         )
 
     async def _step_kw_new(
         self, owner_id: int, chat_id: int, message: BotMessage
     ) -> None:
-        self._states.pop(owner_id, None)
+        await self.cache.clear_fsm(owner_id)
         acc = await self._require_account(owner_id, chat_id=chat_id)
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
         full = message.text or ""
         if "|" not in full:
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Use format: keyword | TEMPLATE_ID or text", icon="err"),
                 self._main_menu_kb(),
@@ -1919,7 +2111,7 @@ class NexaPilotBot:
             reply_start += 1
         reply_raw = full[reply_start:].strip()
         if not trigger or not reply_raw:
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Both keyword and reply are required.", icon="err"),
                 self._main_menu_kb(),
@@ -1930,7 +2122,7 @@ class NexaPilotBot:
         if TEMPLATE_ID_RE.match(cand):
             tpl = await self.db.get_template(uid, cand)
             if not tpl:
-                await self._send_rich(
+                await self.send_ui(
                     chat_id,
                     RichText().line(f"Template {cand} not found.", icon="err"),
                     self._main_menu_kb(),
@@ -1961,21 +2153,22 @@ class NexaPilotBot:
 
         await self.db.upsert_keyword_reply(uid, trigger, tid)
         await self.manager.refresh_user_cache(uid)
-        await self._send_rich(
+        await self.cache.invalidate_user_cache(owner_id, ("settings", "templates", "dashboard"))
+        await self.send_ui(
             chat_id,
             RichText().line(f"Keyword rule saved: \"{trigger}\" -> {tid}", icon="ok"),
-            InlineKeyboardMarkup([[make_button("Keyword Rules", "np:kw", "keywords")]]),
+            InlineKeyboardMarkup([[make_button("Keyword Rules", "np:kw", "keywords", style="primary")]]),
         )
 
     async def _step_sched_once(self, owner_id: int, chat_id: int, text: str) -> None:
-        self._states.pop(owner_id, None)
+        await self.cache.clear_fsm(owner_id)
         acc = await self._require_account(owner_id, chat_id=chat_id)
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
         parts = text.split()
         if len(parts) != 4:
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Format: TEMPLATE_ID CHAT_ID YYYY-MM-DD HH:MM", icon="err"),
                 self._main_menu_kb(),
@@ -1987,14 +2180,14 @@ class NexaPilotBot:
             tzinfo=self.manager.tz
         )
         if run_dt <= datetime.now(self.manager.tz):
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Scheduled time must be in the future.", icon="err"),
                 self._main_menu_kb(),
             )
             return
         if not await self.db.get_template(uid, tpl_id):
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line(f"Template {tpl_id} not found.", icon="err"),
                 self._main_menu_kb(),
@@ -2002,24 +2195,25 @@ class NexaPilotBot:
             return
         row = await self.db.create_scheduled_post(uid, tpl_id, target_chat, run_at=run_dt)
         self.manager._register_onetime_job(int(row["id"]), uid, tpl_id, target_chat, run_dt)
-        await self._send_rich(
+        await self.cache.invalidate_user_cache(owner_id, ("schedules", "dashboard"))
+        await self.send_ui(
             chat_id,
             RichText().line(
                 f"Scheduled Job #{row['id']} for {run_dt.strftime('%Y-%m-%d %H:%M %Z')}",
                 icon="ok",
             ),
-            InlineKeyboardMarkup([[make_button("Schedules", "np:sched", "schedules")]]),
+            InlineKeyboardMarkup([[make_button("Schedules", "np:sched", "schedules", style="primary")]]),
         )
 
     async def _step_sched_every(self, owner_id: int, chat_id: int, text: str) -> None:
-        self._states.pop(owner_id, None)
+        await self.cache.clear_fsm(owner_id)
         acc = await self._require_account(owner_id, chat_id=chat_id)
         if not acc:
             return
         uid = int(acc["telegram_user_id"])
         parts = text.split()
         if len(parts) != 3:
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Format: TEMPLATE_ID CHAT_ID MINUTES", icon="err"),
                 self._main_menu_kb(),
@@ -2029,7 +2223,7 @@ class NexaPilotBot:
         target_chat = int(parts[1])
         mins = int(parts[2])
         if mins < 1 or not await self.db.get_template(uid, tpl_id):
-            await self._send_rich(
+            await self.send_ui(
                 chat_id,
                 RichText().line("Invalid template or minutes (< 1).", icon="err"),
                 self._main_menu_kb(),
@@ -2039,10 +2233,11 @@ class NexaPilotBot:
             uid, tpl_id, target_chat, interval_minutes=mins
         )
         self.manager._register_interval_job(int(row["id"]), uid, tpl_id, target_chat, mins)
-        await self._send_rich(
+        await self.cache.invalidate_user_cache(owner_id, ("schedules", "dashboard"))
+        await self.send_ui(
             chat_id,
             RichText().line(f"Recurring Job #{row['id']} set (every {mins} min).", icon="ok"),
-            InlineKeyboardMarkup([[make_button("Schedules", "np:sched", "schedules")]]),
+            InlineKeyboardMarkup([[make_button("Schedules", "np:sched", "schedules", style="primary")]]),
         )
 
     async def _step_cmp_wizard(
@@ -2050,7 +2245,7 @@ class NexaPilotBot:
     ) -> None:
         acc = await self._require_account(owner_id, chat_id=chat_id)
         if not acc:
-            self._states.pop(owner_id, None)
+            await self.cache.clear_fsm(owner_id)
             return
         uid = int(acc["telegram_user_id"])
         step = st["step"]
@@ -2059,17 +2254,18 @@ class NexaPilotBot:
         if step == "name":
             data["name"] = answer[:60]
             st["step"] = "template_id"
-            tpls = await self.db.list_templates(uid)
+            await self.cache.set_fsm(owner_id, st)
+            tpls = await self._get_cached_templates(owner_id, uid)
             r = RichText().line("Step 2/6 — Send the Template ID:", icon="cmp")
             for t in tpls[:8]:
                 r.line(f"• {t['id']} — {t['text'].replace(chr(10), ' ')[:36]}")
-            await self._send_rich(chat_id, r, self._cancel_kb("np:cmp"))
+            await self.send_ui(chat_id, r, self._cancel_kb("np:cmp"))
             return
 
         if step == "template_id":
             tid = answer.upper()
             if not await self.db.get_template(uid, tid):
-                await self._send_rich(
+                await self.send_ui(
                     chat_id,
                     RichText().line(f"Template {tid} not found. Try again:", icon="err"),
                     self._cancel_kb("np:cmp"),
@@ -2077,23 +2273,24 @@ class NexaPilotBot:
                 return
             data["template_id"] = tid
             st["step"] = "mode_wait"
+            await self.cache.set_fsm(owner_id, st)
             r = RichText().line("Step 3/6 — Choose Target Group Mode:", icon="cmp")
             kb = InlineKeyboardMarkup(
                 [
-                    [make_button("Buy & Sell Groups (Auto)", "np:cmp:mode:buysell", "campaigns")],
-                    [make_button("Specific Telegram Folder", "np:cmp:mode:folder", "folder")],
-                    [make_button("Custom Keywords", "np:cmp:mode:keywords", "keywords")],
-                    [make_button("Folder + Buy & Sell", "np:cmp:mode:folder_buysell", "groups")],
-                    [make_button("Cancel", "np:cancel:np:cmp", "cancel")],
+                    [make_button("Buy & Sell Groups (Auto)", "np:cmp:mode:buysell", "campaigns", style="primary")],
+                    [make_button("Specific Telegram Folder", "np:cmp:mode:folder", "folder", style="primary")],
+                    [make_button("Custom Keywords", "np:cmp:mode:keywords", "keywords", style="primary")],
+                    [make_button("Folder + Buy & Sell", "np:cmp:mode:folder_buysell", "groups", style="primary")],
+                    [make_button("Cancel", "np:cancel:np:cmp", "cancel", style="danger")],
                 ]
             )
-            await self._send_rich(chat_id, r, kb)
+            await self.send_ui(chat_id, r, kb)
             return
 
         if step == "keywords":
             kws = [k.strip().lower() for k in answer.split(",") if k.strip()]
             if not kws:
-                await self._send_rich(
+                await self.send_ui(
                     chat_id,
                     RichText().line("Enter at least 1 keyword:", icon="err"),
                     self._cancel_kb("np:cmp"),
@@ -2101,7 +2298,8 @@ class NexaPilotBot:
                 return
             data["keywords"] = kws
             st["step"] = "max_groups"
-            await self._send_rich(
+            await self.cache.set_fsm(owner_id, st)
+            await self.send_ui(
                 chat_id,
                 RichText().line(
                     "Step 4/6 — Max group limit (e.g. 20, or 0 for unlimited):", icon="cmp"
@@ -2116,7 +2314,8 @@ class NexaPilotBot:
                 raise ValueError("Max groups must be >= 0")
             data["max_groups"] = max_g
             st["step"] = "delay_seconds"
-            await self._send_rich(
+            await self.cache.set_fsm(owner_id, st)
+            await self.send_ui(
                 chat_id,
                 RichText().line(
                     f"Step 5/6 — Delay between groups in seconds ({MIN_CAMPAIGN_DELAY_SECONDS}–{MAX_CAMPAIGN_DELAY_SECONDS}):",
@@ -2134,7 +2333,8 @@ class NexaPilotBot:
                 )
             data["delay_seconds"] = delay_s
             st["step"] = "repeat_interval_minutes"
-            await self._send_rich(
+            await self.cache.set_fsm(owner_id, st)
+            await self.send_ui(
                 chat_id,
                 RichText().line(
                     "Step 6/6 — Repeat interval in minutes (e.g. 60, or 0 for one-time):",
@@ -2149,7 +2349,7 @@ class NexaPilotBot:
             if rep_m < 0:
                 raise ValueError("Repeat minutes must be >= 0")
             data["repeat_interval_minutes"] = rep_m
-            self._states.pop(owner_id, None)
+            await self.cache.clear_fsm(owner_id)
 
             uclient = self.manager.active_clients.get(uid)
             matched = (
@@ -2175,13 +2375,14 @@ class NexaPilotBot:
                 repeat_interval_minutes=data["repeat_interval_minutes"],
                 target_groups=matched,
             )
+            await self.cache.invalidate_user_cache(owner_id, ("campaigns", "dashboard"))
             r = RichText()
             r.line(f"Campaign Created: {cmp['id']}", icon="ok")
             r.line(f"Name: {cmp['name']} | Matched Groups: {len(matched)}")
             kb = InlineKeyboardMarkup(
                 [
-                    [make_button("Launch Now", f"np:cmp:start:{cmp['id']}", "launch_resume")],
-                    [make_button("Manage Campaign", f"np:cmp:view:{cmp['id']}", "manage")],
+                    [make_button("Launch Now", f"np:cmp:start:{cmp['id']}", "launch_resume", style="success")],
+                    [make_button("Manage Campaign", f"np:cmp:view:{cmp['id']}", "manage", style="primary")],
                 ]
             )
-            await self._send_rich(chat_id, r, kb)
+            await self.send_ui(chat_id, r, kb)
