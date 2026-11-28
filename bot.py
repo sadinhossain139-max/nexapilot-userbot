@@ -1201,7 +1201,18 @@ class NexaPilotBot:
                 r.line(f"Account @{me.username or me.id}: ONLINE", icon="connected")
                 r.line(f"Telegram API Latency: {ms} ms", icon="ok")
             except Exception as exc:
-                r.line(f"Ping failed: {exc}", icon="err")
+                from userbot import DEAD_SESSION_ERRORS
+
+                if isinstance(exc, DEAD_SESSION_ERRORS):
+                    await self.manager.handle_session_revoked(
+                        uid,
+                        f"Health ping: {type(exc).__name__}",
+                        owner_user_id=owner_id,
+                    )
+                    r.line("Session was logged out or revoked by Telegram.", icon="disconnected")
+                    r.line("Your account slot is now free — reconnect anytime.", icon="ok")
+                else:
+                    r.line(f"Ping failed: {exc}", icon="err")
 
         r.line(
             f"Active Campaigns: {run_cmps}/{len(cmps)} | Templates: {len(tpls)} | Schedules: {len(scheds)}",

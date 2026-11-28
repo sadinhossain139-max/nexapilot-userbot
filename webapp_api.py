@@ -649,6 +649,20 @@ async def webapp_account_health(
             "first_name": me.first_name,
         }
     except Exception as exc:
+        from userbot import DEAD_SESSION_ERRORS
+
+        if isinstance(exc, DEAD_SESSION_ERRORS):
+            await manager.handle_session_revoked(
+                uid,
+                f"Mini App health ping: {type(exc).__name__}",
+                owner_user_id=owner_id,
+            )
+            return {
+                "online": False,
+                "revoked": True,
+                "latency_ms": None,
+                "error": "Session logged out or revoked. Your slot is now free.",
+            }
         return {"online": False, "latency_ms": None, "error": str(exc)}
 
 

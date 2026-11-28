@@ -26,11 +26,14 @@ from apscheduler.triggers.interval import IntervalTrigger
 from pyrogram import Client, filters, raw
 from pyrogram.enums import ChatType, MessageEntityType, ParseMode, UserStatus
 from pyrogram.errors import (
+    AuthKeyDuplicated,
+    AuthKeyInvalid,
     AuthKeyUnregistered,
     ChatWriteForbidden,
     FloodPremiumWait,
     FloodWait,
     RPCError,
+    SessionExpired,
     SessionRevoked,
     SlowmodeWait,
     UserDeactivated,
@@ -42,6 +45,17 @@ from supabase import Client as SupabaseClient
 from supabase import create_client
 
 logger = logging.getLogger("userbot")
+
+# Centralized tuple of Telegram dead/logged-out/revoked session exceptions
+DEAD_SESSION_ERRORS: tuple[type[BaseException], ...] = (
+    AuthKeyUnregistered,
+    AuthKeyInvalid,
+    AuthKeyDuplicated,
+    SessionRevoked,
+    SessionExpired,
+    UserDeactivated,
+    UserDeactivatedBan,
+)
 
 TEMPLATE_ID_RE = re.compile(r"^TPL-[0-9A-F]{6}$")
 CAMPAIGN_ID_RE = re.compile(r"^CMP-[0-9A-F]{6}$")
@@ -1021,6 +1035,122 @@ class SupabaseStore:
         )
         return bool(r1.data or r2.data)
 
+    async def mark_session_revoked(
+        self,
+        telegram_user_id: int,
+        reason: str = "Session logged out or revoked",
+        *,
+        manual_session_id: int | None = None,
+    ) -> int | None:
+        """
+        Mark a dead/revoked Telegram session inactive in Supabase (user_sessions & manual_sessions),
+        pause any running campaigns for that account, and return the resolved owner_user_id (if any).
+        Safely tolerates optional columns (such as `status`) not existing in the schema.
+        """
+        owner_id: int | None = None
+        short_reason = (reason or "Session logged out or revoked")[:300]
+
+        # 1. Resolve owner_user_id before deactivating (check user_sessions then manual_sessions)
+        try:
+            r_own1 = await self._run(
+                lambda: self._client.table("user_sessions")
+                .select("owner_user_id")
+                .eq("telegram_user_id", telegram_user_id)
+                .limit(1)
+                .execute()
+            )
+            if r_own1.data and r_own1.data[0].get("owner_user_id") is not None:
+                owner_id = int(r_own1.data[0]["owner_user_id"])
+        except Exception as exc:
+            logger.debug("mark_session_revoked owner lookup (user_sessions) skipped: %s", exc)
+
+        if owner_id is None:
+            try:
+                def _query_manual_owner():
+                    q = self._client.table("manual_sessions").select("owner_user_id")
+                    if manual_session_id is not None:
+                        q = q.eq("id", manual_session_id)
+                    else:
+                        q = q.eq("telegram_user_id", telegram_user_id)
+                    return q.limit(1).execute()
+
+                r_own2 = await self._run(_query_manual_owner)
+                if r_own2.data and r_own2.data[0].get("owner_user_id") is not None:
+                    owner_id = int(r_own2.data[0]["owner_user_id"])
+            except Exception as exc:
+                logger.debug("mark_session_revoked owner lookup (manual_sessions) skipped: %s", exc)
+
+        # 2. Deactivate user_sessions row (try with optional `status`, fallback to `is_active` only)
+        if telegram_user_id:
+            try:
+                await self._run(
+                    lambda: self._client.table("user_sessions")
+                    .update({"is_active": False, "status": "logged_out"})
+                    .eq("telegram_user_id", telegram_user_id)
+                    .execute()
+                )
+            except Exception:
+                try:
+                    await self._run(
+                        lambda: self._client.table("user_sessions")
+                        .update({"is_active": False})
+                        .eq("telegram_user_id", telegram_user_id)
+                        .execute()
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to mark user_sessions inactive for user=%s: %s",
+                        telegram_user_id,
+                        exc,
+                    )
+
+        # 3. Deactivate manual_sessions row(s)
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if manual_session_id is not None:
+                await self._run(
+                    lambda: self._client.table("manual_sessions")
+                    .update(
+                        {
+                            "is_active": False,
+                            "last_error": short_reason,
+                            "updated_at": now_iso,
+                        }
+                    )
+                    .eq("id", manual_session_id)
+                    .execute()
+                )
+            elif telegram_user_id:
+                await self._run(
+                    lambda: self._client.table("manual_sessions")
+                    .update(
+                        {
+                            "is_active": False,
+                            "last_error": short_reason,
+                            "updated_at": now_iso,
+                        }
+                    )
+                    .eq("telegram_user_id", telegram_user_id)
+                    .execute()
+                )
+        except Exception as exc:
+            logger.debug("manual_sessions deactivation skipped for user=%s: %s", telegram_user_id, exc)
+
+        # 4. Pause any running campaigns strictly belonging to this telegram_user_id
+        if telegram_user_id:
+            try:
+                await self._run(
+                    lambda: self._client.table("campaigns")
+                    .update({"status": "paused"})
+                    .eq("telegram_user_id", telegram_user_id)
+                    .eq("status", "running")
+                    .execute()
+                )
+            except Exception as exc:
+                logger.debug("Campaign pause on revoke skipped for user=%s: %s", telegram_user_id, exc)
+
+        return owner_id
+
     # -- monetization, referrals & payment_requests --
 
     async def update_bot_user(
@@ -1250,6 +1380,161 @@ class UserbotManager:
         # Per-account send lock so multiple simultaneous campaigns pace safely
         self._account_send_locks: dict[int, asyncio.Lock] = {}
 
+        # Controller bot reference & dead-session notification queue / re-entrancy guard
+        self._bot_ref: Any = None
+        self._pending_revoked_notices: list[tuple[int, int, str]] = []
+        self._revoking_users: set[int] = set()
+
+    def set_bot(self, bot: Any) -> None:
+        """Attach the ftmgram NexaPilotBot instance for user logout/revocation alerts."""
+        self._bot_ref = bot
+
+    async def _notify_user_session_revoked(
+        self, owner_user_id: int, telegram_user_id: int, reason: str
+    ) -> None:
+        """Send a clean ftmgram alert with Premium Custom Emojis and Reconnect button (never raises)."""
+        bot = self._bot_ref
+        if bot is None or not getattr(bot, "is_running", False):
+            # Queue until ftmgram bot finishes starting
+            if not any(o == owner_user_id and u == telegram_user_id for o, u, _ in self._pending_revoked_notices):
+                self._pending_revoked_notices.append((owner_user_id, telegram_user_id, reason))
+            return
+
+        try:
+            from ftmgram.types import InlineKeyboardMarkup, WebAppInfo
+            from config import get_mini_app_url
+            from emojis import RichText, make_button
+
+            r = RichText()
+            r.line("Connected Account Logged Out / Revoked", icon="disconnected")
+            r.line("==================================")
+            r.line(
+                f"Your connected Telegram account (ID: {telegram_user_id}) was logged out or revoked by Telegram.",
+                icon="warn",
+            )
+            r.line("Your active campaigns and scheduled posts were paused safely.")
+            r.line("Your account slot is now free — reconnect anytime below.", icon="ok")
+
+            rows: list[list[Any]] = [
+                [make_button("Reconnect Account", "np:acc:connect", "connect", style="success")]
+            ]
+            mini_url = get_mini_app_url()
+            if mini_url:
+                rows.append(
+                    [
+                        make_button(
+                            "Open NexaPilot App",
+                            icon="webapp",
+                            style="primary",
+                            web_app=WebAppInfo(url=mini_url),
+                        )
+                    ]
+                )
+            rows.append([make_button("Main Menu", "np:home", "home", style="primary")])
+            kb = InlineKeyboardMarkup(rows)
+
+            await bot.send_ui(owner_user_id, r, kb)
+            logger.info(
+                "Sent session-revoked notification to owner=%s for dead user_id=%s",
+                owner_user_id,
+                telegram_user_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not send session-revoked notification to owner=%s (bot blocked or unreachable): %s",
+                owner_user_id,
+                exc,
+            )
+
+    async def flush_pending_revoked_notifications(self) -> None:
+        """Deliver any dead-session alerts queued before ftmgram finished starting."""
+        if not self._pending_revoked_notices:
+            return
+        if self._bot_ref is None or not getattr(self._bot_ref, "is_running", False):
+            return
+        pending = list(self._pending_revoked_notices)
+        self._pending_revoked_notices.clear()
+        for owner_id, tg_uid, reason in pending:
+            await self._notify_user_session_revoked(owner_id, tg_uid, reason)
+
+    async def handle_session_revoked(
+        self,
+        user_id: int,
+        reason: str = "Session logged out or revoked",
+        *,
+        owner_user_id: int | None = None,
+        manual_session_id: int | None = None,
+    ) -> None:
+        """
+        Centralized crash-proof handler for any dead/logged-out/revoked Telegram session:
+        1. Marks user_sessions / manual_sessions inactive & pauses running campaigns in Supabase.
+        2. Cancels only this user's campaign tasks, removes only this user's APScheduler jobs,
+           and safely cleans up the dead client from memory.
+        3. Invalidates Redis cache so Bot Dashboard & Mini App immediately show 0/1 slot free.
+        4. Sends (or queues) an ftmgram alert to owner_user_id with a Green Reconnect button.
+        """
+        guard_key = user_id if user_id else -(manual_session_id or 0)
+        if guard_key in self._revoking_users:
+            return
+        self._revoking_users.add(guard_key)
+        try:
+            logger.warning(
+                "[SESSION REVOKED] Handling dead session for user_id=%s (manual_id=%s): %s",
+                user_id,
+                manual_session_id,
+                reason,
+            )
+
+            # 1. Resolve owner & update Supabase (is_active=False, pause running campaigns)
+            resolved_owner = owner_user_id
+            if resolved_owner is None and user_id:
+                resolved_owner = self._owner_id_cache.get(user_id)
+            db_owner = await self.db.mark_session_revoked(
+                user_id,
+                reason=reason,
+                manual_session_id=manual_session_id,
+            )
+            if resolved_owner is None:
+                resolved_owner = db_owner
+
+            # 2. Remove only this user's APScheduler jobs (sched_*)
+            if user_id and self.scheduler is not None:
+                try:
+                    for job in list(self.scheduler.get_jobs()):
+                        if job.id.startswith("sched_") and len(job.args) >= 2 and int(job.args[1]) == int(user_id):
+                            try:
+                                self.scheduler.remove_job(job.id)
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    logger.debug("Scheduler cleanup on revoke for user=%s failed: %s", user_id, exc)
+
+            # 3. Cancel this user's campaign tasks & safely clean up dead client in memory
+            if user_id:
+                try:
+                    await self.stop_client(user_id)
+                except Exception as exc:
+                    logger.debug("stop_client during revoke for user=%s ignored: %s", user_id, exc)
+                self._owner_id_cache.pop(user_id, None)
+
+            # 4. Invalidate Redis cache so Bot & Mini App immediately reflect 0/1 account slot
+            if self.cache is not None:
+                targets = {t for t in (resolved_owner, user_id) if t}
+                for tid in targets:
+                    try:
+                        await self.cache.invalidate_user_cache(int(tid))
+                    except Exception as exc:
+                        logger.debug("Redis invalidation on revoke for %s failed: %s", tid, exc)
+
+            # 5. Notify the user via ftmgram bot (or queue until bot is online)
+            notify_target = resolved_owner or (user_id if user_id else None)
+            if notify_target:
+                await self._notify_user_session_revoked(int(notify_target), int(user_id), reason)
+        except Exception as exc:
+            logger.exception("Unexpected error inside handle_session_revoked(user_id=%s): %s", user_id, exc)
+        finally:
+            self._revoking_users.discard(guard_key)
+
     async def _check_account_entitlement(
         self, telegram_user_id: int, feature: str | None = None
     ) -> bool:
@@ -1323,21 +1608,27 @@ class UserbotManager:
             )
 
     async def start_all_sessions(self) -> None:
-        """Load active sessions from user_sessions first, then manual_sessions, with deduplication."""
+        """Load active sessions from user_sessions first, then manual_sessions, with full per-account isolation."""
         seen_session_strings: set[str] = set()
         started_count = 0
 
         # 1. Endpoint-authenticated sessions (take precedence)
-        sessions = await self.db.get_active_sessions()
+        try:
+            sessions = await self.db.get_active_sessions()
+        except Exception as exc:
+            logger.exception("Failed to load user_sessions from Supabase: %s", exc)
+            sessions = []
+
         logger.info("Found %d active user_sessions row(s) in Supabase.", len(sessions))
         for row in sessions:
-            user_id = int(row["telegram_user_id"])
-            session_string = (row.get("session_string") or "").strip()
-            if not session_string:
-                continue
-            if started_count > 0:
-                await asyncio.sleep(STARTUP_STAGGER_SECONDS)
+            user_id = 0
             try:
+                user_id = int(row["telegram_user_id"])
+                session_string = (row.get("session_string") or "").strip()
+                if not session_string:
+                    continue
+                if started_count > 0:
+                    await asyncio.sleep(STARTUP_STAGGER_SECONDS)
                 await self.start_client(
                     user_id,
                     session_string,
@@ -1346,20 +1637,22 @@ class UserbotManager:
                 )
                 seen_session_strings.add(session_string)
                 started_count += 1
-            except (
-                AuthKeyUnregistered,
-                SessionRevoked,
-                UserDeactivated,
-                UserDeactivatedBan,
-            ) as exc:
+            except DEAD_SESSION_ERRORS as exc:
                 logger.error(
-                    "Session for user %s is invalid/revoked (%s); marking inactive.",
+                    "Session for user %s is dead/revoked at startup (%s); running handle_session_revoked.",
                     user_id,
                     exc,
                 )
-                await self.db.set_user_active(user_id, False)
+                raw_owner = row.get("owner_user_id")
+                await self.handle_session_revoked(
+                    user_id,
+                    f"Startup {type(exc).__name__}: {exc}",
+                    owner_user_id=int(raw_owner) if raw_owner is not None else None,
+                )
+                continue
             except Exception as exc:
                 logger.exception("Failed to start userbot client for user %s: %s", user_id, exc)
+                continue
 
         # 2. User-pasted manual_sessions rows
         try:
@@ -1373,13 +1666,21 @@ class UserbotManager:
 
         logger.info("Found %d active manual_sessions row(s) in Supabase.", len(manual_rows))
         for row in manual_rows:
-            started = await self.start_manual_client(
-                row,
-                seen_session_strings=seen_session_strings,
-                stagger=(started_count > 0),
-            )
-            if started:
-                started_count += 1
+            try:
+                started = await self.start_manual_client(
+                    row,
+                    seen_session_strings=seen_session_strings,
+                    stagger=(started_count > 0),
+                )
+                if started:
+                    started_count += 1
+            except Exception as exc:
+                logger.exception(
+                    "Unexpected error starting manual_sessions row id=%s: %s",
+                    row.get("id"),
+                    exc,
+                )
+                continue
 
     async def _safe_update_manual_status(self, row_id: int, **kwargs: Any) -> None:
         """Update manual_sessions status without letting a transient DB error abort startup."""
@@ -1501,10 +1802,7 @@ class UserbotManager:
             return True
 
         except (
-            AuthKeyUnregistered,
-            SessionRevoked,
-            UserDeactivated,
-            UserDeactivatedBan,
+            *DEAD_SESSION_ERRORS,
             ValueError,
             TypeError,
             binascii.Error,
@@ -1528,9 +1826,19 @@ class UserbotManager:
                 row_id,
                 err_msg,
             )
-            await self._safe_update_manual_status(
-                row_id, is_active=False, last_error=err_msg
-            )
+            raw_owner = row.get("owner_user_id")
+            target_uid = int(registered_uid or known_uid or 0)
+            if isinstance(exc, DEAD_SESSION_ERRORS) and (target_uid or raw_owner is not None):
+                await self.handle_session_revoked(
+                    target_uid,
+                    f"Startup {err_msg}",
+                    owner_user_id=int(raw_owner) if raw_owner is not None else None,
+                    manual_session_id=row_id,
+                )
+            else:
+                await self._safe_update_manual_status(
+                    row_id, is_active=False, last_error=err_msg
+                )
             return False
 
         except Exception as exc:
@@ -1900,7 +2208,24 @@ class UserbotManager:
                 await self.db.deactivate_scheduled_post(job_id, telegram_user_id)
             return
 
-        await send_template_message(client, target_chat_id, template)
+        try:
+            await send_template_message(client, target_chat_id, template)
+        except DEAD_SESSION_ERRORS as exc:
+            await self.handle_session_revoked(
+                telegram_user_id,
+                f"Scheduled post {job_id}: {type(exc).__name__}",
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                "Scheduled job %s failed for user=%s -> chat=%s: %s",
+                job_id,
+                telegram_user_id,
+                target_chat_id,
+                exc,
+            )
+            return
+
         logger.info(
             "Executed scheduled job %s -> chat=%s template=%s (user=%s)",
             job_id,
@@ -1915,20 +2240,31 @@ class UserbotManager:
     # -- Handler Registration --
 
     def _attach_handlers(self, client: Client, telegram_user_id: int) -> None:
+        async def _guarded(label: str, coro: Any) -> None:
+            try:
+                await coro
+            except DEAD_SESSION_ERRORS as exc:
+                await self.handle_session_revoked(
+                    telegram_user_id,
+                    f"{label}: {type(exc).__name__}",
+                )
+            except Exception as exc:
+                logger.warning("[%s] Handler error for user=%s: %s", label, telegram_user_id, exc)
+
         async def _on_saved_command(c: Client, m: Message) -> None:
-            await self._handle_saved_messages_command(c, m, telegram_user_id)
+            await _guarded("SAVED_CMD", self._handle_saved_messages_command(c, m, telegram_user_id))
 
         async def _on_mention(c: Client, m: Message) -> None:
-            await self._handle_mention(c, m, telegram_user_id)
+            await _guarded("MENTION", self._handle_mention(c, m, telegram_user_id))
 
         async def _on_welcome(c: Client, m: Message) -> None:
-            await self._handle_welcome(c, m, telegram_user_id)
+            await _guarded("WELCOME", self._handle_welcome(c, m, telegram_user_id))
 
         async def _on_keyword(c: Client, m: Message) -> None:
-            await self._handle_keyword_reply(c, m, telegram_user_id)
+            await _guarded("KEYWORD", self._handle_keyword_reply(c, m, telegram_user_id))
 
         async def _on_offline(c: Client, m: Message) -> None:
-            await self._handle_offline(c, m, telegram_user_id)
+            await _guarded("OFFLINE", self._handle_offline(c, m, telegram_user_id))
 
         async def _on_user_status(c: Client, user: User) -> None:
             if user and getattr(user, "id", None) == telegram_user_id:
@@ -3442,6 +3778,8 @@ class UserbotManager:
                         await asyncio.sleep(wait_sec + 1)
                         continue
                     return False, f"FloodWait({wait_sec}s)"
+                except DEAD_SESSION_ERRORS:
+                    raise
                 except SlowmodeWait as exc:
                     return False, f"SlowmodeWait({getattr(exc, 'value', '?')}s)"
                 except ChatWriteForbidden:
@@ -3639,6 +3977,17 @@ class UserbotManager:
         except asyncio.CancelledError:
             logger.info("[CAMPAIGN] Loop cancelled for %s", campaign_id)
             raise
+        except DEAD_SESSION_ERRORS as exc:
+            logger.warning(
+                "[CAMPAIGN] Dead session during %s for user=%s (%s); revoking cleanly.",
+                campaign_id,
+                telegram_user_id,
+                type(exc).__name__,
+            )
+            await self.handle_session_revoked(
+                telegram_user_id,
+                f"Campaign {campaign_id}: {type(exc).__name__}",
+            )
         except Exception as exc:
             logger.exception("[CAMPAIGN] Unhandled error in loop %s: %s", campaign_id, exc)
             try:

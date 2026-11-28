@@ -235,7 +235,10 @@ async def lifespan(_app: FastAPI):
     from redis_cache import RedisCache
 
     redis_cache = RedisCache()
-    await redis_cache.connect()
+    try:
+        await redis_cache.connect()
+    except Exception as exc:
+        logger.warning("Redis connection failed during startup (continuing without cache): %s", exc)
 
     scheduler = AsyncIOScheduler(timezone=tz)
     db_store = SupabaseStore(config["supabase_url"], config["supabase_key"])
@@ -256,10 +259,7 @@ async def lifespan(_app: FastAPI):
         replace_existing=True,
     )
 
-    await userbot_manager.start_all_sessions()
-    await userbot_manager.reload_scheduled_posts()
-    await userbot_manager.reload_campaigns()
-
+    # Start ftmgram controller bot BEFORE restoring userbots so revocation alerts deliver immediately
     bot_token = os.environ.get("BOT_TOKEN", "").strip()
     if bot_token:
         try:
@@ -274,6 +274,7 @@ async def lifespan(_app: FastAPI):
                 cache=redis_cache,
             )
             await nexapilot_bot.start()
+            userbot_manager.set_bot(nexapilot_bot)
         except Exception as exc:
             logger.exception("Failed to start NexaPilot ftmgram bot: %s", exc)
             nexapilot_bot = None
@@ -289,12 +290,48 @@ async def lifespan(_app: FastAPI):
         api_hash=config["api_hash"],
     )
 
-    logger.info("NexaPilot Userbot Automation Server is ready (Kurigram + ftmgram + Redis + Mini App).")
+    async def _restore_userbots_background() -> None:
+        """Restore Kurigram sessions, schedules, and campaigns without blocking Uvicorn port binding."""
+        assert userbot_manager is not None
+        try:
+            logger.info("Background userbot restoration started...")
+            await userbot_manager.start_all_sessions()
+            try:
+                await userbot_manager.reload_scheduled_posts()
+            except Exception as exc:
+                logger.exception("Failed to reload scheduled posts during startup: %s", exc)
+            try:
+                await userbot_manager.reload_campaigns()
+            except Exception as exc:
+                logger.exception("Failed to reload campaigns during startup: %s", exc)
+            await userbot_manager.flush_pending_revoked_notifications()
+            logger.info("Background userbot restoration complete.")
+        except asyncio.CancelledError:
+            logger.info("Background userbot restoration cancelled during shutdown.")
+            raise
+        except Exception as exc:
+            logger.exception("Unhandled error in background userbot restoration: %s", exc)
+
+    startup_restore_task = asyncio.create_task(
+        _restore_userbots_background(),
+        name="restore_userbots_background",
+    )
+
+    logger.info(
+        "NexaPilot Server ready — binding HTTP port immediately while userbots restore in background."
+    )
 
     try:
         yield
     finally:
         logger.info("Shutting down NexaPilot Userbot Automation Server...")
+        if not startup_restore_task.done():
+            startup_restore_task.cancel()
+            try:
+                await startup_restore_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         await cleanup_webapp_logins(force_all=True)
 
         if nexapilot_bot is not None:
