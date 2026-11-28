@@ -227,19 +227,10 @@ def get_dynamic_plans(settings: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def get_dynamic_payment_methods(settings: dict[str, Any]) -> list[dict[str, str]]:
-    key_map = {
-        "bkash": "PAY_BKASH",
-        "nagad": "PAY_NAGAD",
-        "rocket": "PAY_ROCKET",
-        "trx": "PAY_TRX",
-        "usdt": "PAY_USDT",
-        "btc": "PAY_BTC",
-        "card": "PAY_CARD",
-    }
     methods: list[dict[str, str]] = []
     for base in PAYMENT_METHODS_CONFIG:
-        skey = key_map.get(base["key"])
-        details = str(settings.get(skey, "") or "").strip() if skey else base["details"]
+        skey = base.get("env")
+        details = str(settings.get(skey, "") or "").strip() if skey else ""
         if details:
             methods.append({**base, "details": details})
     return methods

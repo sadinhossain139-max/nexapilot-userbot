@@ -145,6 +145,7 @@ _PAYMENT_METHOD_SPECS: tuple[dict[str, str], ...] = (
     {"key": "btc", "label": "Bitcoin (BTC)", "env": "PAY_BTC", "currency": "USD", "emoji_key": "pay_crypto"},
     {"key": "card", "label": "Visa / Mastercard", "env": "PAY_CARD", "currency": "USD", "emoji_key": "pay_card"},
 )
+PAYMENT_METHODS_CONFIG: tuple[dict[str, str], ...] = _PAYMENT_METHOD_SPECS
 
 
 def get_configured_payment_methods() -> list[dict[str, str]]:
