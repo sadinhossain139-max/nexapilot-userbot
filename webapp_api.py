@@ -72,6 +72,7 @@ _runtime: dict[str, Any] = {
     "bot": None,
     "api_id": 0,
     "api_hash": "",
+    "agent_engine": None,
 }
 
 # In-memory temporary Kurigram login clients for Mini App direct OTP: owner_id -> dict
@@ -87,6 +88,7 @@ def configure_webapp_runtime(
     bot: Any,
     api_id: int,
     api_hash: str,
+    agent_engine: Any = None,
 ) -> None:
     _runtime["db"] = db
     _runtime["cache"] = cache
@@ -94,6 +96,7 @@ def configure_webapp_runtime(
     _runtime["bot"] = bot
     _runtime["api_id"] = api_id
     _runtime["api_hash"] = api_hash
+    _runtime["agent_engine"] = agent_engine
 
 
 async def cleanup_webapp_logins(*, force_all: bool = False) -> None:
@@ -1216,3 +1219,129 @@ async def webapp_payment_history(
     owner_id = user["owner_user_id"]
     rows = await db.list_user_payment_requests(owner_id)
     return {"payments": rows}
+
+
+# ---------------------------------------------------------------------------
+# Autonomous AI Agent Endpoints (/api/webapp/agent/*)
+# ---------------------------------------------------------------------------
+
+
+class WebAppAgentConfigUpdateReq(BaseModel):
+    enabled: bool | None = None
+    auto_reply_enabled: bool | None = None
+    agent_name: str | None = Field(None, max_length=60)
+    tone_style: str | None = None
+    response_language: str | None = None
+    system_prompt: str | None = Field(None, max_length=3000)
+    custom_rules: str | None = Field(None, max_length=3000)
+    excluded_chats: list[str] | str | None = None
+    voice_reply_enabled: bool | None = None
+    tts_voice: str | None = None
+    perm_reply_private: bool | None = None
+    perm_send_private: bool | None = None
+    perm_post_groups: bool | None = None
+    perm_post_channels: bool | None = None
+    perm_react: bool | None = None
+    perm_control_server: bool | None = None
+    perm_billing_actions: bool | None = None
+
+
+class WebAppAgentChatReq(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2500)
+
+
+def _get_agent_engine() -> Any:
+    eng = _runtime.get("agent_engine")
+    if eng is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI Agent engine is not initialized.",
+        )
+    return eng
+
+
+@router.get("/agent/config")
+async def webapp_get_agent_config(
+    user: dict[str, Any] = Depends(get_verified_user),
+) -> dict[str, Any]:
+    from agent_engine import AGENT_PERMISSION_META
+
+    db, cache, _, _ = _get_runtime()
+    eng = _get_agent_engine()
+    owner_id = user["owner_user_id"]
+    ent = await get_user_entitlement(db, cache, owner_id)
+    cfg = await eng.get_config(owner_id)
+    return {
+        "config": cfg,
+        "permissions_meta": AGENT_PERMISSION_META,
+        "can_use_agent_task": bool(ent.get("can_use_agent_task")),
+        "can_use_agent_autonomous": bool(ent.get("can_use_agent_autonomous")),
+        "proxy_count": len(eng.proxy_pool.nodes),
+    }
+
+
+@router.post("/agent/config")
+async def webapp_update_agent_config(
+    payload: WebAppAgentConfigUpdateReq,
+    user: dict[str, Any] = Depends(get_verified_user),
+) -> dict[str, Any]:
+    db, cache, _, _ = _get_runtime()
+    eng = _get_agent_engine()
+    owner_id = user["owner_user_id"]
+    ent = await get_user_entitlement(db, cache, owner_id)
+    updates = payload.model_dump(exclude_none=True)
+    if updates.get("auto_reply_enabled") and not ent.get("can_use_agent_autonomous"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "FEATURE_LOCKED",
+                "message": "Autonomous Incoming Reply requires Ultra Premium.",
+                "required_plan": "ultra",
+            },
+        )
+    saved = await eng.save_config(owner_id, updates)
+    return {"config": saved}
+
+
+@router.post("/agent/chat")
+async def webapp_agent_chat(
+    payload: WebAppAgentChatReq,
+    user: dict[str, Any] = Depends(get_verified_user),
+) -> dict[str, Any]:
+    eng = _get_agent_engine()
+    owner_id = user["owner_user_id"]
+    res = await eng.run_agent_chat(
+        owner_id,
+        payload.message,
+        trigger_source="miniapp_chat",
+        chat_key="miniapp",
+    )
+    if not res.get("ok") and res.get("error") == "FEATURE_LOCKED":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "FEATURE_LOCKED", "message": res["reply"], "required_plan": "premium"},
+        )
+    return res
+
+
+@router.get("/agent/logs")
+async def webapp_agent_logs(
+    limit: int = Query(15, ge=1, le=50),
+    user: dict[str, Any] = Depends(get_verified_user),
+) -> dict[str, Any]:
+    db, _, _, _ = _get_runtime()
+    owner_id = user["owner_user_id"]
+    rows = await db.list_agent_action_logs(owner_id, limit=limit)
+    return {"logs": rows}
+
+
+@router.post("/agent/memory/clear")
+async def webapp_agent_clear_memory(
+    user: dict[str, Any] = Depends(get_verified_user),
+) -> dict[str, Any]:
+    _, cache, _, _ = _get_runtime()
+    owner_id = user["owner_user_id"]
+    if cache is not None:
+        await cache.clear_agent_memory(owner_id, "miniapp")
+        await cache.clear_agent_memory(owner_id, "bot")
+    return {"cleared": True}

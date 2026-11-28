@@ -34,6 +34,7 @@
       campaigns: "campaigns",
       templates: "templates",
       plans: "plans",
+      agent: "chat",
     },
     skipTrialGate: false,
     loginStep: 1, // 1=phone, 2=otp, 3=2fa
@@ -49,6 +50,9 @@
     plans: null,
     payments: null,
     referrals: null,
+    agentData: null,
+    agentLogs: null,
+    agentMessages: [],
     countdownTimer: null,
   };
 
@@ -275,6 +279,7 @@
     else if (state.tab === "campaigns") renderCampaignsTab();
     else if (state.tab === "templates") renderTemplatesTab();
     else if (state.tab === "plans") renderPlansTab();
+    else if (state.tab === "agent") renderAgentTab();
   }
 
   // =========================================================================
@@ -417,6 +422,17 @@
         </div>
       </div>
 
+      <section class="card card-hero" style="margin-bottom:12px;">
+        <div class="card-header" style="margin-bottom:8px;">
+          <h3 class="card-title">${I("bot", 18)} Autonomous AI Agent</h3>
+          <span class="pill ${entitlement.can_use_agent_task ? "pill-emerald" : "pill-gold"}">${entitlement.can_use_agent_autonomous ? "Full Auto" : entitlement.can_use_agent_task ? "Task Mode" : "Premium+"}</span>
+        </div>
+        <p style="margin:0 0 12px;font-size:12.5px;color:var(--text-muted);">
+          Chat with your AI Agent, configure persona & rules, and control all 7 security permissions.
+        </p>
+        <button id="dash-go-agent" class="btn btn-emerald btn-full" type="button">${I("bot", 16)} Open AI Agent Hub</button>
+      </section>
+
       <div class="btn-row">
         <button id="dash-go-cmp" class="btn btn-blue" type="button">${I("megaphone", 16)} Campaigns</button>
         <button id="dash-go-ref" class="btn btn-ghost" type="button">${I("users", 16)} Refer & Earn</button>
@@ -428,6 +444,11 @@
     if (oa) oa.addEventListener("click", () => { state.tab = "account"; render(); });
     const ca = $("dash-connect-acc");
     if (ca) ca.addEventListener("click", () => { state.tab = "account"; render(); });
+    $("dash-go-agent").addEventListener("click", () => {
+      haptic("light");
+      state.tab = "agent";
+      render();
+    });
     $("dash-go-cmp").addEventListener("click", () => { state.tab = "campaigns"; render(); });
     $("dash-go-ref").addEventListener("click", () => {
       state.tab = "plans";
@@ -1386,6 +1407,327 @@
     } catch (err) {
       $("plans-pane").innerHTML = `<div class="empty-state">${esc(err.message)}</div>`;
     }
+  }
+
+  // =========================================================================
+  // AI AGENT HUB (CHAT CONSOLE, PERSONA & RULES FORM, 7-PERMISSION MATRIX)
+  // =========================================================================
+
+  async function renderAgentTab() {
+    const sub = state.subTab.agent || "chat";
+    $("app-root").innerHTML = `
+      <div class="card-header" style="margin-bottom:10px;">
+        <h3 class="card-title">${I("bot", 18)} NexaPilot AI Agent</h3>
+        <button id="agent-back-home" class="btn btn-ghost btn-sm" type="button">Dashboard</button>
+      </div>
+      <div class="segmented">
+        <button class="seg-btn ${sub === "chat" ? "active" : ""}" data-asub="chat" type="button">Chat</button>
+        <button class="seg-btn ${sub === "persona" ? "active" : ""}" data-asub="persona" type="button">Persona & Rules</button>
+        <button class="seg-btn ${sub === "perms" ? "active" : ""}" data-asub="perms" type="button">Permissions</button>
+      </div>
+      <div id="agent-pane"><div class="skeleton" style="height:180px;"></div></div>`;
+
+    $("agent-back-home").addEventListener("click", () => {
+      state.tab = "dashboard";
+      render();
+    });
+    document.querySelectorAll("[data-asub]").forEach((b) => {
+      b.addEventListener("click", () => {
+        state.subTab.agent = b.getAttribute("data-asub");
+        haptic("light");
+        renderAgentTab();
+      });
+    });
+
+    try {
+      const [cfgData, logsData] = await Promise.all([
+        api("/agent/config"),
+        sub === "chat" ? api("/agent/logs?limit=8") : Promise.resolve(state.agentLogs || { logs: [] }),
+      ]);
+      state.agentData = cfgData;
+      if (sub === "chat") state.agentLogs = logsData;
+
+      if (sub === "chat") renderAgentChatPane(cfgData, logsData.logs || []);
+      else if (sub === "persona") renderAgentPersonaPane(cfgData);
+      else renderAgentPermsPane(cfgData);
+    } catch (err) {
+      $("agent-pane").innerHTML = `<div class="empty-state">${esc(err.message)}</div>`;
+    }
+  }
+
+  function renderAgentChatPane(data, logs) {
+    const cfg = data.config || {};
+    if (!data.can_use_agent_task) {
+      $("agent-pane").innerHTML = `
+        <div class="lock-card">
+          <div class="lock-icon-wrap">${I("lock", 24)}</div>
+          <h3 style="margin:0 0 6px;font-size:16px;">AI Agent — Premium & Ultra Feature</h3>
+          <p style="margin:0 0 16px;color:var(--text-muted);font-size:13px;">Upgrade to Premium for AI Task Mode or Ultra Premium for Full Autonomous Inbox/Group Agent + Voice.</p>
+          <button id="btn-agent-upgrade" class="btn btn-blue" type="button">${I("crown", 16)} View Plans</button>
+        </div>`;
+      $("btn-agent-upgrade").addEventListener("click", () => { state.tab = "plans"; render(); });
+      return;
+    }
+
+    const msgsHtml =
+      state.agentMessages.length === 0
+        ? `<div class="empty-state" style="padding:28px 10px;">
+             Ask <strong>${esc(cfg.agent_name || "Nexa Agent")}</strong> in Bangla or English.<br/>
+             <span style="font-size:12px;color:var(--text-dim);">e.g. "Check my health & campaigns", "Schedule a DM in 10 min", or "Show payment methods"</span>
+           </div>`
+        : state.agentMessages
+            .map((m) => {
+              const pills = (m.tool_events || [])
+                .map(
+                  (ev) =>
+                    `<span class="tool-pill ${ev.ok ? "" : "denied"}">${ev.ok ? I("check", 11) : I("lock", 11)} ${esc(ev.tool)}</span>`
+                )
+                .join("");
+              return `<div class="chat-bubble ${m.role}">${esc(m.text)}${pills ? `<div class="tool-pills">${pills}</div>` : ""}</div>`;
+            })
+            .join("");
+
+    $("agent-pane").innerHTML = `
+      ${!cfg.enabled ? `<div class="card" style="border-color:rgba(245,158,11,0.38);padding:12px;margin-bottom:10px;font-size:12.5px;color:#FBBF24;">Agent Master Switch is OFF. Turn it ON in <strong>Persona & Rules</strong> to start chatting.</div>` : ""}
+      <div class="card" style="padding:12px;">
+        <div class="card-header" style="margin-bottom:8px;">
+          <span class="pill ${cfg.enabled ? "pill-emerald" : "pill-muted"}">${esc(cfg.agent_name || "Nexa Agent")} · ${cfg.enabled ? "ON" : "OFF"}</span>
+          <button id="btn-agent-clear" class="btn btn-ghost btn-sm" type="button">${I("trash", 12)} Clear</button>
+        </div>
+        <div id="agent-feed" class="chat-feed">${msgsHtml}</div>
+        <div class="chat-composer">
+          <input id="agent-input" class="input" placeholder="Give your AI Agent a task..." />
+          <button id="agent-send" class="btn btn-blue btn-icon" type="button" aria-label="Send">${I("send", 16)}</button>
+        </div>
+      </div>
+      <div class="section-label">Recent Agent Action Logs</div>
+      ${logs.length === 0
+        ? `<div class="empty-state" style="padding:14px;">No tool actions recorded yet.</div>`
+        : logs
+            .map((l) => {
+              const cls = l.status === "success" ? "pill-emerald" : l.status === "denied" ? "pill-crimson" : "pill-gold";
+              return `
+                <div class="item-card" style="padding:11px 13px;">
+                  <div class="item-top" style="margin-bottom:4px;">
+                    <span class="mono" style="font-weight:700;color:var(--text);">${esc(l.tool_name)}</span>
+                    <span class="pill ${cls}">${esc(String(l.status || "").toUpperCase())}</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);">${esc(l.result_summary || "")}</div>
+                </div>`;
+            })
+            .join("")}`;
+
+    const feed = $("agent-feed");
+    if (feed) feed.scrollTop = feed.scrollHeight;
+
+    $("btn-agent-clear").addEventListener("click", async () => {
+      await api("/agent/memory/clear", { method: "POST" });
+      state.agentMessages = [];
+      toast("Agent conversation memory cleared", "success");
+      renderAgentChatPane(data, logs);
+    });
+
+    const sendNow = async () => {
+      const inp = $("agent-input");
+      const text = inp.value.trim();
+      if (!text) return;
+      inp.value = "";
+      state.agentMessages.push({ role: "user", text });
+      renderAgentChatPane(data, logs);
+      const sendBtn = $("agent-send");
+      if (sendBtn) sendBtn.disabled = true;
+      try {
+        const res = await api("/agent/chat", { method: "POST", body: { message: text } });
+        state.agentMessages.push({
+          role: "assistant",
+          text: res.reply || "Done.",
+          tool_events: res.tool_events || [],
+        });
+        const freshLogs = await api("/agent/logs?limit=8");
+        state.agentLogs = freshLogs;
+        renderAgentChatPane(data, freshLogs.logs || []);
+      } catch (err) {
+        state.agentMessages.push({ role: "assistant", text: `Error: ${err.message}` });
+        renderAgentChatPane(data, logs);
+      }
+    };
+
+    $("agent-send").addEventListener("click", sendNow);
+    $("agent-input").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") sendNow();
+    });
+  }
+
+  function renderAgentPersonaPane(data) {
+    const cfg = data.config || {};
+    const excl = Array.isArray(cfg.excluded_chats) ? cfg.excluded_chats.join(", ") : "";
+    const sp = cfg.system_prompt || "";
+    const cr = cfg.custom_rules || "";
+
+    $("agent-pane").innerHTML = `
+      <div class="card">
+        <div class="toggle-row" style="padding-top:0;">
+          <div>
+            <div style="font-weight:700;">Enable AI Agent (Master Switch)</div>
+            <div style="font-size:11.5px;color:var(--text-dim);">Allow Agent Task Console & permitted automations</div>
+          </div>
+          <label class="switch"><input id="ag-enabled" type="checkbox" ${cfg.enabled ? "checked" : ""} /><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div>
+            <div style="font-weight:700;">Autonomous Incoming Reply ${data.can_use_agent_autonomous ? "" : '<span class="pill pill-gold" style="margin-left:4px;">Ultra</span>'}</div>
+            <div style="font-size:11.5px;color:var(--text-dim);">Auto-reply to incoming DMs & group mentions</div>
+          </div>
+          <label class="switch"><input id="ag-auto" type="checkbox" ${cfg.auto_reply_enabled ? "checked" : ""} ${data.can_use_agent_autonomous ? "" : "disabled"} /><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div>
+            <div style="font-weight:700;">Voice Replies (Edge TTS)</div>
+            <div style="font-size:11.5px;color:var(--text-dim);">Synthesize & send Bangla/English voice notes</div>
+          </div>
+          <label class="switch"><input id="ag-voice" type="checkbox" ${cfg.voice_reply_enabled ? "checked" : ""} /><span class="slider"></span></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="field">
+          <label for="ag-name">Agent Name</label>
+          <input id="ag-name" class="input" maxlength="60" value="${esc(cfg.agent_name || "Nexa Agent")}" />
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div class="field">
+            <label for="ag-tone">Tone Preset</label>
+            <select id="ag-tone" class="select">
+              ${["professional", "friendly", "sales", "concise", "custom"]
+                .map((t) => `<option value="${t}" ${cfg.tone_style === t ? "selected" : ""}>${t[0].toUpperCase() + t.slice(1)}</option>`)
+                .join("")}
+            </select>
+          </div>
+          <div class="field">
+            <label for="ag-lang">Response Language</label>
+            <select id="ag-lang" class="select">
+              <option value="auto" ${cfg.response_language === "auto" ? "selected" : ""}>Auto Match</option>
+              <option value="bn" ${cfg.response_language === "bn" ? "selected" : ""}>Bangla</option>
+              <option value="en" ${cfg.response_language === "en" ? "selected" : ""}>English</option>
+              <option value="banglish" ${cfg.response_language === "banglish" ? "selected" : ""}>Banglish</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="ag-tts">TTS Voice (Bangla / English)</label>
+          <select id="ag-tts" class="select">
+            <option value="bn-BD-PradeepNeural" ${cfg.tts_voice === "bn-BD-PradeepNeural" ? "selected" : ""}>bn-BD-PradeepNeural (Bangla Male)</option>
+            <option value="bn-BD-NabanitaNeural" ${cfg.tts_voice === "bn-BD-NabanitaNeural" ? "selected" : ""}>bn-BD-NabanitaNeural (Bangla Female)</option>
+            <option value="en-US-AndrewNeural" ${cfg.tts_voice === "en-US-AndrewNeural" ? "selected" : ""}>en-US-AndrewNeural (English Male)</option>
+            <option value="en-US-AvaNeural" ${cfg.tts_voice === "en-US-AvaNeural" ? "selected" : ""}>en-US-AvaNeural (English Female)</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <div class="label-row">
+            <label for="ag-prompt" style="margin:0;">System Prompt (Persona & Behavior)</label>
+            <span id="cnt-prompt" class="char-count">${sp.length} / 3000</span>
+          </div>
+          <textarea id="ag-prompt" class="textarea" maxlength="3000" style="min-height:130px;" placeholder="Describe who your agent is, how it should greet people, and how it should represent you...">${esc(sp)}</textarea>
+        </div>
+
+        <div class="field">
+          <div class="label-row">
+            <label for="ag-rules" style="margin:0;">Custom Rules, FAQ & Boundaries</label>
+            <span id="cnt-rules" class="char-count">${cr.length} / 3000</span>
+          </div>
+          <textarea id="ag-rules" class="textarea" maxlength="3000" style="min-height:130px;" placeholder="List explicit Do's, Don'ts, product prices, business hours, or escalation rules...">${esc(cr)}</textarea>
+        </div>
+
+        <div class="field">
+          <label for="ag-excl">Excluded Chats (comma-separated chat IDs or @usernames)</label>
+          <input id="ag-excl" class="input mono" value="${esc(excl)}" placeholder="@boss_username, -1001234567890" />
+        </div>
+
+        <button id="btn-save-agent" class="btn btn-emerald btn-full" type="button">${I("check", 16)} Save Agent Configuration</button>
+      </div>`;
+
+    $("ag-prompt").addEventListener("input", (e) => {
+      $("cnt-prompt").textContent = `${e.target.value.length} / 3000`;
+    });
+    $("ag-rules").addEventListener("input", (e) => {
+      $("cnt-rules").textContent = `${e.target.value.length} / 3000`;
+    });
+
+    $("btn-save-agent").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        const res = await api("/agent/config", {
+          method: "POST",
+          body: {
+            enabled: $("ag-enabled").checked,
+            auto_reply_enabled: $("ag-auto").checked,
+            voice_reply_enabled: $("ag-voice").checked,
+            agent_name: $("ag-name").value.trim(),
+            tone_style: $("ag-tone").value,
+            response_language: $("ag-lang").value,
+            tts_voice: $("ag-tts").value,
+            system_prompt: $("ag-prompt").value,
+            custom_rules: $("ag-rules").value,
+            excluded_chats: $("ag-excl").value,
+          },
+        });
+        state.agentData.config = res.config;
+        toast("AI Agent configuration saved!", "success");
+      } catch (err) {
+        toast(err.message, "error");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  function renderAgentPermsPane(data) {
+    const cfg = data.config || {};
+    const meta = data.permissions_meta || [];
+
+    $("agent-pane").innerHTML = `
+      <div class="card">
+        <div class="card-header" style="margin-bottom:6px;">
+          <h3 class="card-title">${I("shield", 17)} Security Permissions Matrix</h3>
+          <span class="pill pill-blue">Server-Enforced</span>
+        </div>
+        <p style="margin:0 0 10px;font-size:12px;color:var(--text-muted);">
+          Every tool checks these toggles server-side before executing. Changes save instantly.
+        </p>
+        ${meta
+          .map(
+            (p) => `
+          <div class="toggle-row">
+            <div style="padding-right:8px;">
+              <div style="font-weight:700;font-size:13.5px;">${esc(p.label)}</div>
+              <div style="font-size:11.5px;color:var(--text-dim);">${esc(p.description)}</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" data-perm="${esc(p.key)}" ${cfg[p.key] ? "checked" : ""} />
+              <span class="slider"></span>
+            </label>
+          </div>`
+          )
+          .join("")}
+      </div>`;
+
+    $("agent-pane").querySelectorAll("[data-perm]").forEach((cb) => {
+      cb.addEventListener("change", async () => {
+        const key = cb.getAttribute("data-perm");
+        const val = cb.checked;
+        haptic("light");
+        try {
+          const res = await api("/agent/config", { method: "POST", body: { [key]: val } });
+          state.agentData.config = res.config;
+          toast(`${key.replace("perm_", "").replace(/_/g, " ")} -> ${val ? "ON" : "OFF"}`, "success");
+        } catch (err) {
+          cb.checked = !val;
+          toast(err.message, "error");
+        }
+      });
+    });
   }
 
   // Static Shell Bindings & Boot

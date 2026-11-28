@@ -88,6 +88,8 @@ def compute_entitlement_from_user(bot_user: dict[str, Any] | None) -> dict[str, 
             "max_campaigns": 0,
             "can_use_schedules": False,
             "can_use_auto_replies": False,
+            "can_use_agent_task": False,
+            "can_use_agent_autonomous": False,
         }
 
     raw_plan = str(bot_user.get("plan_type") or "none").strip().lower()
@@ -115,6 +117,14 @@ def compute_entitlement_from_user(bot_user: dict[str, Any] | None) -> dict[str, 
     db_max_acc = int(bot_user.get("max_accounts") or 0)
     max_accounts = max(cfg["max_accounts"], db_max_acc) if is_active else 0
 
+    import os as _os
+
+    task_min = _os.environ.get("AGENT_TASK_MIN_PLAN", "premium").strip().lower()
+    auto_min = _os.environ.get("AGENT_AUTO_MIN_PLAN", "ultra").strip().lower()
+    eff_rank = PLAN_RANK.get(effective, 0) if is_active else 0
+    can_agent_task = is_active and eff_rank >= PLAN_RANK.get(task_min, 2)
+    can_agent_auto = is_active and eff_rank >= PLAN_RANK.get(auto_min, 3)
+
     return {
         "raw_plan": raw_plan,
         "effective_plan": effective,
@@ -122,6 +132,7 @@ def compute_entitlement_from_user(bot_user: dict[str, Any] | None) -> dict[str, 
         "is_active": is_active,
         "is_expired": is_expired,
         "plan_expires_at": exp_dt.isoformat() if exp_dt else None,
+        "expires_at": exp_dt.isoformat() if exp_dt else None,
         "remaining_text": rem_text,
         "trial_claimed": bool(bot_user.get("trial_claimed", False)),
         "channel_verified": bool(bot_user.get("channel_verified", False)),
@@ -133,6 +144,8 @@ def compute_entitlement_from_user(bot_user: dict[str, Any] | None) -> dict[str, 
         "max_campaigns": cfg["max_campaigns"],
         "can_use_schedules": bool(cfg["can_use_schedules"]),
         "can_use_auto_replies": bool(cfg["can_use_auto_replies"]),
+        "can_use_agent_task": can_agent_task,
+        "can_use_agent_autonomous": can_agent_auto,
     }
 
 
@@ -169,6 +182,8 @@ async def is_user_plan_active(
     - feature=None / 'campaigns' / 'templates': requires active plan (trial/premium/ultra).
     - feature='schedules': requires active plan with can_use_schedules (premium/ultra).
     - feature='auto_replies': requires active plan with can_use_auto_replies (ultra).
+    - feature='agent_task': requires active plan with can_use_agent_task (default premium+).
+    - feature='agent_auto': requires active plan with can_use_agent_autonomous (default ultra).
     """
     ent = await get_user_entitlement(db, cache, owner_user_id)
     if not ent.get("is_active"):
@@ -177,6 +192,10 @@ async def is_user_plan_active(
         return bool(ent.get("can_use_schedules"))
     if feature == "auto_replies":
         return bool(ent.get("can_use_auto_replies"))
+    if feature == "agent_task":
+        return bool(ent.get("can_use_agent_task"))
+    if feature == "agent_auto":
+        return bool(ent.get("can_use_agent_autonomous"))
     return True
 
 

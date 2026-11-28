@@ -1,0 +1,260 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+logger = logging.getLogger("nexapilot.ai_proxy_pool")
+
+PROXY_COOLDOWN_SECONDS = int(os.environ.get("AI_PROXY_COOLDOWN_SECONDS", "60") or "60")
+PROXY_TIMEOUT_SECONDS = float(os.environ.get("AI_PROXY_TIMEOUT_SECONDS", "45") or "45")
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+@dataclass(frozen=True)
+class ProxyNode:
+    id: str
+    url: str
+    key: str
+
+
+class AIProxyPoolError(RuntimeError):
+    """Raised when all configured AI proxy servers are unavailable or exhausted."""
+
+
+def load_proxy_nodes_from_env() -> list[ProxyNode]:
+    """
+    Load AI proxy nodes from Environment Variables.
+    Supports BOTH:
+      1. Numbered pairs: AI_PROXY_1_URL + AI_PROXY_1_KEY ... AI_PROXY_10_URL + AI_PROXY_10_KEY
+         (with optional fallback AI_PROXY_DEFAULT_KEY)
+      2. JSON array: AI_PROXIES_JSON='[{"id":"p1","url":"https://...","key":"..."}]'
+    """
+    default_key = os.environ.get("AI_PROXY_DEFAULT_KEY", "").strip()
+    nodes: list[ProxyNode] = []
+    seen_urls: set[str] = set()
+
+    # 1. Numbered ENV pairs (1..10)
+    for idx in range(1, 11):
+        url = os.environ.get(f"AI_PROXY_{idx}_URL", "").strip().rstrip("/")
+        key = os.environ.get(f"AI_PROXY_{idx}_KEY", "").strip() or default_key
+        if url:
+            if url not in seen_urls:
+                seen_urls.add(url)
+                nodes.append(ProxyNode(id=f"p{idx}", url=url, key=key))
+
+    # 2. Optional JSON array ENV
+    raw_json = os.environ.get("AI_PROXIES_JSON", "").strip()
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, list):
+                for idx, item in enumerate(parsed, start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url") or "").strip().rstrip("/")
+                    key = str(item.get("key") or default_key).strip()
+                    pid = str(item.get("id") or f"jp{idx}").strip()
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        nodes.append(ProxyNode(id=pid, url=url, key=key))
+        except Exception as exc:
+            logger.warning("Failed to parse AI_PROXIES_JSON: %s", exc)
+
+    return nodes
+
+
+class AIProxyPool:
+    """
+    Multi-Server AI Proxy Load Balancer with Redis Round-Robin, Automatic Failover & Cooldown.
+    - Chat: POST {PROXY_URL}/chat/completions with header `x-proxy-key: {PROXY_KEY}`
+    - TTS:  POST {PROXY_URL}/tts with header `x-proxy-key: {PROXY_KEY}`
+    """
+
+    def __init__(
+        self,
+        cache: Any | None = None,
+        nodes: list[ProxyNode] | None = None,
+        timeout_seconds: float = PROXY_TIMEOUT_SECONDS,
+        cooldown_seconds: int = PROXY_COOLDOWN_SECONDS,
+    ) -> None:
+        self.cache = cache
+        self.nodes: list[ProxyNode] = nodes if nodes is not None else load_proxy_nodes_from_env()
+        self.timeout_seconds = timeout_seconds
+        self.cooldown_seconds = cooldown_seconds
+        self._rr_mem_idx: int = 0
+        self._mem_cooldowns: dict[str, float] = {}
+        self._http: httpx.AsyncClient | None = None
+
+    @property
+    def is_configured(self) -> bool:
+        return len(self.nodes) > 0
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout_seconds, connect=10.0),
+                limits=httpx.Limits(max_connections=30, max_keepalive_connections=12),
+            )
+        return self._http
+
+    async def close(self) -> None:
+        if self._http is not None and not self._http.is_closed:
+            try:
+                await self._http.aclose()
+            except Exception as exc:
+                logger.debug("Error closing AIProxyPool httpx client: %s", exc)
+        self._http = None
+
+    async def _next_start_index(self) -> int:
+        if not self.nodes:
+            return 0
+        if self.cache is not None and hasattr(self.cache, "next_ai_proxy_index"):
+            idx = await self.cache.next_ai_proxy_index()
+            if idx is not None:
+                return int(idx) % len(self.nodes)
+        idx = self._rr_mem_idx
+        self._rr_mem_idx = (self._rr_mem_idx + 1) % len(self.nodes)
+        return idx
+
+    async def _is_in_cooldown(self, proxy_id: str) -> bool:
+        exp = self._mem_cooldowns.get(proxy_id, 0.0)
+        if exp > time.monotonic():
+            return True
+        if self.cache is not None and hasattr(self.cache, "is_ai_proxy_in_cooldown"):
+            return bool(await self.cache.is_ai_proxy_in_cooldown(proxy_id))
+        return False
+
+    async def _mark_cooldown(self, proxy_id: str, reason: str) -> None:
+        self._mem_cooldowns[proxy_id] = time.monotonic() + self.cooldown_seconds
+        logger.warning(
+            "AI proxy '%s' placed in %ss cooldown (%s).",
+            proxy_id,
+            self.cooldown_seconds,
+            reason,
+        )
+        if self.cache is not None and hasattr(self.cache, "set_ai_proxy_cooldown"):
+            await self.cache.set_ai_proxy_cooldown(proxy_id, self.cooldown_seconds)
+
+    async def _ordered_candidates(self) -> list[ProxyNode]:
+        if not self.nodes:
+            return []
+        start = await self._next_start_index()
+        rotated = self.nodes[start:] + self.nodes[:start]
+        healthy: list[ProxyNode] = []
+        cooling: list[ProxyNode] = []
+        for node in rotated:
+            if await self._is_in_cooldown(node.id):
+                cooling.append(node)
+            else:
+                healthy.append(node)
+        # Prefer healthy nodes; if every node is cooling down, still try them as last resort
+        return healthy if healthy else cooling
+
+    async def chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] = "auto",
+        temperature: float = 0.4,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Execute an OpenAI-compatible Chat Completion across healthy proxies with automatic failover."""
+        if not self.nodes:
+            raise AIProxyPoolError(
+                "No AI Proxy servers configured. Set AI_PROXY_1_URL / AI_PROXY_1_KEY in Environment Variables."
+            )
+
+        payload: dict[str, Any] = {
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        client = self._get_client()
+        candidates = await self._ordered_candidates()
+        last_error = "All AI proxies failed"
+
+        for node in candidates:
+            headers = {"Content-Type": "application/json"}
+            if node.key:
+                headers["x-proxy-key"] = node.key
+            url = f"{node.url}/chat/completions"
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code in RETRYABLE_STATUS_CODES:
+                    last_error = f"{node.id} HTTP {resp.status_code}"
+                    await self._mark_cooldown(node.id, last_error)
+                    continue
+                if resp.status_code >= 400:
+                    body_preview = resp.text[:240]
+                    last_error = f"{node.id} HTTP {resp.status_code}: {body_preview}"
+                    logger.warning("AI proxy %s returned client error: %s", node.id, last_error)
+                    await self._mark_cooldown(node.id, f"HTTP {resp.status_code}")
+                    continue
+                data = resp.json()
+                if isinstance(data, dict) and data.get("choices"):
+                    return data
+                last_error = f"{node.id} returned empty choices"
+                await self._mark_cooldown(node.id, last_error)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = f"{node.id} network/timeout error: {type(exc).__name__}"
+                await self._mark_cooldown(node.id, last_error)
+            except Exception as exc:
+                last_error = f"{node.id} unexpected error: {exc}"
+                await self._mark_cooldown(node.id, last_error)
+
+        raise AIProxyPoolError(f"All AI proxy servers failed. Last error: {last_error}")
+
+    async def generate_tts(
+        self,
+        text: str,
+        voice: str = "bn-BD-PradeepNeural",
+        rate: str = "+0%",
+        volume: str = "+0%",
+    ) -> bytes:
+        """Generate MP3 speech bytes via proxy POST /tts with automatic failover."""
+        if not self.nodes:
+            raise AIProxyPoolError("No AI Proxy servers configured for TTS.")
+
+        payload = {
+            "text": text.strip()[:1500],
+            "voice": voice or "bn-BD-PradeepNeural",
+            "rate": rate,
+            "volume": volume,
+        }
+        client = self._get_client()
+        candidates = await self._ordered_candidates()
+        last_error = "All AI proxies failed for TTS"
+
+        for node in candidates:
+            headers = {"Content-Type": "application/json"}
+            if node.key:
+                headers["x-proxy-key"] = node.key
+            url = f"{node.url}/tts"
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code in RETRYABLE_STATUS_CODES or resp.status_code >= 400:
+                    last_error = f"{node.id} TTS HTTP {resp.status_code}"
+                    await self._mark_cooldown(node.id, last_error)
+                    continue
+                if resp.content:
+                    return resp.content
+                last_error = f"{node.id} returned empty TTS audio"
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = f"{node.id} TTS network/timeout: {type(exc).__name__}"
+                await self._mark_cooldown(node.id, last_error)
+            except Exception as exc:
+                last_error = f"{node.id} TTS error: {exc}"
+                await self._mark_cooldown(node.id, last_error)
+
+        raise AIProxyPoolError(f"All AI proxy servers failed for TTS. Last error: {last_error}")

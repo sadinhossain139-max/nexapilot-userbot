@@ -117,6 +117,7 @@ class NexaPilotBot:
         db: SupabaseStore,
         manager: UserbotManager,
         cache: RedisCache | None = None,
+        agent_engine: Any = None,
     ) -> None:
         self.bot_token = bot_token
         self.api_id = api_id
@@ -124,6 +125,7 @@ class NexaPilotBot:
         self.db = db
         self.manager = manager
         self.cache = cache if cache is not None else RedisCache("")
+        self.agent_engine = agent_engine
 
         self.client = BotClient(
             name="nexapilot_bot",
@@ -492,6 +494,9 @@ class NexaPilotBot:
         rows.extend(
             [
                 [
+                    make_button("AI Agent", "np:agent", "ai_agent", style="success"),
+                ],
+                [
                     make_button("My Account", "np:acc", "my_account", style="primary"),
                     tpl_btn,
                 ],
@@ -857,6 +862,42 @@ class NexaPilotBot:
                 return
             if data.startswith("np:pay:plan:"):
                 await self._view_payment_methods(cq, owner_id, data.split(":")[-1])
+                return
+
+            # ---- Autonomous AI Agent Menu & Controls ----
+            if data == "np:agent":
+                await self._view_agent_menu(cq, owner_id)
+                return
+            if data == "np:agent:toggle:enabled":
+                await self._toggle_agent_flag(cq, owner_id, "enabled")
+                return
+            if data == "np:agent:toggle:auto":
+                await self._toggle_agent_flag(cq, owner_id, "auto_reply_enabled")
+                return
+            if data == "np:agent:chat":
+                await self._start_agent_chat(cq, owner_id)
+                return
+            if data == "np:agent:exit":
+                await self.cache.clear_fsm(owner_id)
+                await self._view_agent_menu(cq, owner_id)
+                return
+            if data == "np:agent:perms":
+                await self._view_agent_perms(cq, owner_id)
+                return
+            if data.startswith("np:agent:perm:"):
+                await self._toggle_agent_perm(cq, owner_id, data.split("np:agent:perm:", 1)[1])
+                return
+            if data == "np:agent:prompt":
+                await self._view_agent_prompt_menu(cq, owner_id)
+                return
+            if data == "np:agent:set:prompt":
+                await self._start_agent_text_edit(cq, owner_id, "agent_prompt_set")
+                return
+            if data == "np:agent:set:rules":
+                await self._start_agent_text_edit(cq, owner_id, "agent_rules_set")
+                return
+            if data == "np:agent:logs":
+                await self._view_agent_logs(cq, owner_id)
                 return
             if data.startswith("np:pay:method:"):
                 _, _, _, plan_key, method_key = data.split(":", 4)
@@ -2139,6 +2180,10 @@ class NexaPilotBot:
                 return
             if flow == "login_phone":
                 await self._step_login_phone(owner_id, chat_id, text)
+            elif flow == "agent_chat":
+                await self._step_agent_chat(owner_id, chat_id, text)
+            elif flow in ("agent_prompt_set", "agent_rules_set"):
+                await self._step_agent_prompt_or_rules(owner_id, chat_id, text, flow)
             elif flow == "login_otp":
                 await self._step_login_otp(owner_id, chat_id, text)
             elif flow == "login_2fa":
@@ -3145,4 +3190,271 @@ class NexaPilotBot:
                 )
             except Exception as exc:
                 logger.warning("Could not notify user %s of payment rejection: %s", target_user_id, exc)
+
+    # =========================================================================
+    # Autonomous AI Agent Bot Interface (100% send_ui / edit_ui + Colored Buttons)
+    # =========================================================================
+
+    async def _view_agent_menu(self, cq: CallbackQuery, owner_id: int) -> None:
+        if self.agent_engine is None:
+            r = RichText()
+            r.line("AI Agent Engine is currently unavailable.", icon="warn")
+            await self.edit_ui(cq, r, InlineKeyboardMarkup([[make_button("Main Menu", "np:home", "home", style="primary")]]))
+            return
+
+        ent = await get_user_entitlement(self.db, self.cache, owner_id)
+        cfg = await self.agent_engine.get_config(owner_id)
+        enabled = bool(cfg.get("enabled"))
+        auto_on = bool(cfg.get("auto_reply_enabled"))
+        can_task = bool(ent.get("can_use_agent_task"))
+        can_auto = bool(ent.get("can_use_agent_autonomous"))
+
+        r = RichText()
+        r.line(f"NexaPilot AI Agent — {cfg.get('agent_name') or 'Nexa Agent'}", icon="ai_agent")
+        r.line("==================================")
+        r.line(f"Master Switch: {'ENABLED' if enabled else 'DISABLED'}", icon="ok" if enabled else "disconnected")
+        r.line(
+            f"Autonomous Incoming Reply: {'ON' if auto_on else 'OFF'}"
+            + ("" if can_auto else " (Ultra Required)"),
+            icon="ai_brain",
+        )
+        r.line(
+            f"Tone: {cfg.get('tone_style', 'professional')} | Lang: {cfg.get('response_language', 'auto')} | Voice: {'ON' if cfg.get('voice_reply_enabled') else 'OFF'}",
+            icon="ai_voice",
+        )
+        if not can_task:
+            r.line("Upgrade to Premium or Ultra to unlock AI Agent Task Mode.", icon="premium")
+
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                make_button(
+                    "Talk to Agent (Task Mode)",
+                    "np:agent:chat",
+                    "ai_chat" if can_task else "locked",
+                    style="success" if can_task else "primary",
+                )
+            ],
+            [
+                make_button(
+                    f"Master: {'ON' if enabled else 'OFF'}",
+                    "np:agent:toggle:enabled",
+                    "ai_perm_on" if enabled else "ai_perm_off",
+                    style="success" if enabled else "danger",
+                ),
+                make_button(
+                    f"Auto-Reply: {'ON' if auto_on else 'OFF'}",
+                    "np:agent:toggle:auto",
+                    "ai_perm_on" if auto_on else "ai_perm_off",
+                    style="success" if auto_on else "danger",
+                ),
+            ],
+            [
+                make_button("Permissions", "np:agent:perms", "ai_perms", style="primary"),
+                make_button("Prompt & Rules", "np:agent:prompt", "ai_prompt", style="primary"),
+            ],
+            [
+                make_button("Action Logs", "np:agent:logs", "ai_logs", style="primary"),
+                make_button("Main Menu", "np:home", "home", style="primary"),
+            ],
+        ]
+        await self.edit_ui(cq, r, InlineKeyboardMarkup(rows))
+
+    async def _toggle_agent_flag(self, cq: CallbackQuery, owner_id: int, flag: str) -> None:
+        if self.agent_engine is None:
+            return
+        ent = await get_user_entitlement(self.db, self.cache, owner_id)
+        cfg = await self.agent_engine.get_config(owner_id)
+        new_val = not bool(cfg.get(flag))
+        if flag == "auto_reply_enabled" and new_val and not ent.get("can_use_agent_autonomous"):
+            await self._show_upgrade_wall(cq, owner_id, "Autonomous Incoming AI Agent", "ultra")
+            return
+        await self.agent_engine.save_config(owner_id, {flag: new_val})
+        await self._view_agent_menu(cq, owner_id)
+
+    async def _view_agent_perms(self, cq: CallbackQuery, owner_id: int) -> None:
+        if self.agent_engine is None:
+            return
+        from agent_engine import AGENT_PERMISSION_META
+
+        cfg = await self.agent_engine.get_config(owner_id)
+        r = RichText()
+        r.line("AI Agent Security Permissions", icon="ai_shield")
+        r.line("==================================")
+        r.line("Tap any permission below to toggle ON (Green) or OFF (Red).")
+        r.line("Every tool enforces these flags strictly on the server.", icon="lock")
+
+        rows: list[list[InlineKeyboardButton]] = []
+        for meta in AGENT_PERMISSION_META:
+            key = meta["key"]
+            is_on = bool(cfg.get(key))
+            rows.append(
+                [
+                    make_button(
+                        f"{meta['label']}: {'ON' if is_on else 'OFF'}",
+                        f"np:agent:perm:{key}",
+                        "ai_perm_on" if is_on else "ai_perm_off",
+                        style="success" if is_on else "danger",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                make_button("Back to AI Agent", "np:agent", "back", style="primary"),
+                make_button("Main Menu", "np:home", "home", style="primary"),
+            ]
+        )
+        await self.edit_ui(cq, r, InlineKeyboardMarkup(rows))
+
+    async def _toggle_agent_perm(self, cq: CallbackQuery, owner_id: int, perm_key: str) -> None:
+        if self.agent_engine is None:
+            return
+        from agent_engine import PERMISSION_KEYS
+
+        if perm_key not in PERMISSION_KEYS:
+            return
+        cfg = await self.agent_engine.get_config(owner_id)
+        await self.agent_engine.save_config(owner_id, {perm_key: not bool(cfg.get(perm_key))})
+        await self._view_agent_perms(cq, owner_id)
+
+    async def _view_agent_prompt_menu(self, cq: CallbackQuery, owner_id: int) -> None:
+        if self.agent_engine is None:
+            return
+        cfg = await self.agent_engine.get_config(owner_id)
+        sp = (cfg.get("system_prompt") or "").strip()
+        cr = (cfg.get("custom_rules") or "").strip()
+
+        r = RichText()
+        r.line("AI Agent Persona & Custom Rules", icon="ai_brain")
+        r.line("==================================")
+        r.line(f"System Prompt ({len(sp)}/3000 chars):", icon="ai_brain")
+        r.line(sp[:350] + ("..." if len(sp) > 350 else "") if sp else "(Not set yet)")
+        r.line("")
+        r.line(f"Custom Rules ({len(cr)}/3000 chars):", icon="ai_rules")
+        r.line(cr[:350] + ("..." if len(cr) > 350 else "") if cr else "(Not set yet)")
+
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                make_button("Edit System Prompt", "np:agent:set:prompt", "ai_prompt", style="primary"),
+                make_button("Edit Custom Rules", "np:agent:set:rules", "ai_prompt", style="primary"),
+            ]
+        ]
+        mini_url = get_mini_app_url()
+        if mini_url:
+            rows.append(
+                [
+                    make_button(
+                        "Open Rich Editor in Mini App",
+                        emoji_key="webapp",
+                        style="success",
+                        web_app=WebAppInfo(url=mini_url),
+                    )
+                ]
+            )
+        rows.append(
+            [
+                make_button("Back to AI Agent", "np:agent", "back", style="primary"),
+                make_button("Main Menu", "np:home", "home", style="primary"),
+            ]
+        )
+        await self.edit_ui(cq, r, InlineKeyboardMarkup(rows))
+
+    async def _start_agent_text_edit(self, cq: CallbackQuery, owner_id: int, flow: str) -> None:
+        await self.cache.set_fsm(owner_id, {"flow": flow})
+        label = "System Prompt (Persona & Behavior)" if flow == "agent_prompt_set" else "Custom Rules & FAQ"
+        r = RichText()
+        r.line(f"Update {label}", icon="ai_brain" if flow == "agent_prompt_set" else "ai_rules")
+        r.line("Send your new text below (up to 3000 characters), or tap Cancel.")
+        await self.edit_ui(cq, r, self._cancel_kb("np:agent:prompt"))
+
+    async def _step_agent_prompt_or_rules(
+        self, owner_id: int, chat_id: int, text: str, flow: str
+    ) -> None:
+        await self.cache.clear_fsm(owner_id)
+        if self.agent_engine is None:
+            return
+        field = "system_prompt" if flow == "agent_prompt_set" else "custom_rules"
+        await self.agent_engine.save_config(owner_id, {field: text[:3000]})
+        r = RichText()
+        r.line("AI Agent configuration updated!", icon="ai_task_done")
+        r.line(f"Saved {len(text[:3000])}/3000 characters to {field}.")
+        kb = InlineKeyboardMarkup(
+            [
+                [make_button("Prompt & Rules", "np:agent:prompt", "ai_prompt", style="primary")],
+                [make_button("AI Agent Menu", "np:agent", "ai_agent", style="primary")],
+            ]
+        )
+        await self.send_ui(chat_id, r, kb)
+
+    async def _start_agent_chat(self, cq: CallbackQuery, owner_id: int) -> None:
+        ent = await get_user_entitlement(self.db, self.cache, owner_id)
+        if not ent.get("can_use_agent_task"):
+            await self._show_upgrade_wall(cq, owner_id, "NexaPilot AI Agent", "premium")
+            return
+        await self.cache.set_fsm(owner_id, {"flow": "agent_chat"}, ttl=1800)
+        r = RichText()
+        r.line("AI Agent Chat Mode Active", icon="ai_agent")
+        r.line("==================================")
+        r.line("Type any task in Bangla or English (e.g. check health, list campaigns, schedule a DM, or get payment details).")
+        r.line("Tap Exit Agent Chat anytime to return to the menu.", icon="ai_shield")
+        kb = InlineKeyboardMarkup(
+            [[make_button("Exit Agent Chat", "np:agent:exit", "ai_exit", style="danger")]]
+        )
+        await self.edit_ui(cq, r, kb)
+
+    async def _step_agent_chat(self, owner_id: int, chat_id: int, text: str) -> None:
+        if self.agent_engine is None:
+            return
+        res = await self.agent_engine.run_agent_chat(
+            owner_id,
+            text,
+            trigger_source="bot_chat",
+            chat_key="bot",
+        )
+        # Keep agent chat FSM alive until user taps Exit
+        await self.cache.set_fsm(owner_id, {"flow": "agent_chat"}, ttl=1800)
+        r = RichText()
+        r.line("AI Agent Reply", icon="ai_agent")
+        r.line(res.get("reply") or "Done.")
+        events = res.get("tool_events") or []
+        if events:
+            r.line("")
+            for ev in events[:5]:
+                r.line(
+                    f"Tool {ev['tool']}: {'OK' if ev['ok'] else ev.get('status', 'DENIED')}",
+                    icon="ai_task_done" if ev["ok"] else "lock",
+                )
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    make_button("Permissions", "np:agent:perms", "ai_perms", style="primary"),
+                    make_button("Exit Agent Chat", "np:agent:exit", "ai_exit", style="danger"),
+                ]
+            ]
+        )
+        await self.send_ui(chat_id, r, kb)
+
+    async def _view_agent_logs(self, cq: CallbackQuery, owner_id: int) -> None:
+        logs = await self.db.list_agent_action_logs(owner_id, limit=5)
+        r = RichText()
+        r.line("Recent AI Agent Action Logs (Last 5)", icon="ai_log")
+        r.line("==================================")
+        if not logs:
+            r.line("No tool actions recorded yet.")
+        else:
+            for item in logs:
+                st = str(item.get("status") or "").upper()
+                ic = "ai_task_done" if st == "SUCCESS" else ("lock" if st == "DENIED" else "warn")
+                r.line(f"[{st}] {item.get('tool_name')} ({item.get('trigger_source')})", icon=ic)
+                if item.get("result_summary"):
+                    r.line(f"  {str(item['result_summary'])[:110]}")
+        kb = InlineKeyboardMarkup(
+            [
+                [make_button("Refresh Logs", "np:agent:logs", "refresh", style="primary")],
+                [
+                    make_button("Back to AI Agent", "np:agent", "back", style="primary"),
+                    make_button("Main Menu", "np:home", "home", style="primary"),
+                ],
+            ]
+        )
+        await self.edit_ui(cq, r, kb)
 

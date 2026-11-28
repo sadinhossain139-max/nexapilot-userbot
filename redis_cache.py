@@ -17,17 +17,20 @@ USER_CACHE_TTLS: dict[str, int] = {
     "campaigns": 60,
     "settings": 180,
     "schedules": 120,
+    "agent_config": 180,
 }
 
 FSM_TTL_SECONDS = 600
+AGENT_MEM_TTL_SECONDS = 1800
+AGENT_MEM_MAX_MESSAGES = 12
 
 
 class RedisCache:
     """
-    Async Redis fast-UI caching & FSM state layer for NexaPilot.
+    Async Redis fast-UI caching, FSM state, and AI Agent memory/rate-limit layer for NexaPilot.
     - Supports both redis:// and TLS rediss:// URLs (Upstash, Redis Cloud, Render Key Value).
     - Strictly isolates every key by owner_user_id.
-    - Gracefully falls back to Supabase + in-memory FSM if REDIS_URL is unset or Redis is unreachable.
+    - Gracefully falls back to Supabase + in-memory storage if REDIS_URL is unset or Redis is unreachable.
     """
 
     def __init__(self, redis_url: str | None = None) -> None:
@@ -37,6 +40,10 @@ class RedisCache:
         self._warned_offline: bool = False
         # In-memory FSM fallback: owner_user_id -> (expires_monotonic, state_dict)
         self._mem_fsm: dict[int, tuple[float, dict[str, Any]]] = {}
+        # In-memory fallbacks for AI agent memory, rate limit, and chat cooldown
+        self._mem_agent_history: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._mem_rate_limits: dict[str, tuple[float, int]] = {}
+        self._mem_chat_cooldowns: dict[str, float] = {}
 
     async def connect(self) -> None:
         if not self.redis_url:
@@ -77,6 +84,9 @@ class RedisCache:
             self._client = None
         self.is_connected = False
         self._mem_fsm.clear()
+        self._mem_agent_history.clear()
+        self._mem_rate_limits.clear()
+        self._mem_chat_cooldowns.clear()
 
     def _log_degraded_once(self, op: str, exc: Exception) -> None:
         if not self._warned_offline:
@@ -172,3 +182,136 @@ class RedisCache:
                 await self._client.delete(self._fsm_key(user_id))
             except Exception as exc:
                 self._log_degraded_once("FSM_DEL", exc)
+
+    # -- AI Agent Short-Term Memory (np:u:{user_id}:agent_mem:{chat_key}, TTL 1800s) --
+
+    @staticmethod
+    def _agent_mem_key(user_id: int, chat_key: str) -> str:
+        return f"np:u:{int(user_id)}:agent_mem:{chat_key}"
+
+    async def get_agent_memory(
+        self, user_id: int, chat_key: str
+    ) -> list[dict[str, Any]]:
+        key = self._agent_mem_key(user_id, chat_key)
+        if self.is_connected and self._client is not None:
+            try:
+                raw = await self._client.get(key)
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        return parsed
+                return []
+            except Exception as exc:
+                self._log_degraded_once("AGENT_MEM_GET", exc)
+
+        entry = self._mem_agent_history.get(key)
+        if not entry:
+            return []
+        exp, items = entry
+        if time.monotonic() > exp:
+            self._mem_agent_history.pop(key, None)
+            return []
+        return list(items)
+
+    async def append_agent_memory(
+        self,
+        user_id: int,
+        chat_key: str,
+        new_messages: list[dict[str, Any]],
+        *,
+        max_items: int = AGENT_MEM_MAX_MESSAGES,
+        ttl: int = AGENT_MEM_TTL_SECONDS,
+    ) -> list[dict[str, Any]]:
+        existing = await self.get_agent_memory(user_id, chat_key)
+        merged = (existing + new_messages)[-max_items:]
+        key = self._agent_mem_key(user_id, chat_key)
+        self._mem_agent_history[key] = (time.monotonic() + ttl, merged)
+        if self.is_connected and self._client is not None:
+            try:
+                await self._client.set(key, json.dumps(merged, default=str), ex=ttl)
+            except Exception as exc:
+                self._log_degraded_once("AGENT_MEM_SET", exc)
+        return merged
+
+    async def clear_agent_memory(self, user_id: int, chat_key: str) -> None:
+        key = self._agent_mem_key(user_id, chat_key)
+        self._mem_agent_history.pop(key, None)
+        if self.is_connected and self._client is not None:
+            try:
+                await self._client.delete(key)
+            except Exception as exc:
+                self._log_degraded_once("AGENT_MEM_DEL", exc)
+
+    # -- AI Agent Per-User Rate Limiter & Per-Chat Autonomous Cooldown --
+
+    async def check_agent_rate_limit(
+        self, user_id: int, limit: int = 20, window_seconds: int = 60
+    ) -> bool:
+        """Returns True if within rate limit, False if throttled."""
+        key = f"np:u:{int(user_id)}:agent_rl"
+        if self.is_connected and self._client is not None:
+            try:
+                count = await self._client.incr(key)
+                if count == 1:
+                    await self._client.expire(key, window_seconds)
+                return int(count) <= limit
+            except Exception as exc:
+                self._log_degraded_once("AGENT_RL", exc)
+
+        now = time.monotonic()
+        exp, count = self._mem_rate_limits.get(key, (0.0, 0))
+        if now > exp:
+            self._mem_rate_limits[key] = (now + window_seconds, 1)
+            return True
+        if count >= limit:
+            return False
+        self._mem_rate_limits[key] = (exp, count + 1)
+        return True
+
+    async def check_agent_chat_cooldown(
+        self, user_id: int, chat_key: str, cooldown_seconds: int = 8
+    ) -> bool:
+        """Returns True and sets cooldown if chat is ready for an autonomous reply; False if cooling down."""
+        key = f"np:u:{int(user_id)}:agent_cd:{chat_key}"
+        if self.is_connected and self._client is not None:
+            try:
+                ok = await self._client.set(key, "1", ex=cooldown_seconds, nx=True)
+                return bool(ok)
+            except Exception as exc:
+                self._log_degraded_once("AGENT_CD", exc)
+
+        now = time.monotonic()
+        exp = self._mem_chat_cooldowns.get(key, 0.0)
+        if now < exp:
+            return False
+        self._mem_chat_cooldowns[key] = now + cooldown_seconds
+        return True
+
+    # -- AI Proxy Pool Round-Robin & Cooldown Helpers --
+
+    async def next_ai_proxy_index(self) -> int | None:
+        if not self.is_connected or self._client is None:
+            return None
+        try:
+            val = await self._client.incr("np:ai:rr_idx")
+            return int(val) - 1
+        except Exception as exc:
+            self._log_degraded_once("AI_RR", exc)
+            return None
+
+    async def set_ai_proxy_cooldown(self, proxy_id: str, ttl: int = 60) -> None:
+        if not self.is_connected or self._client is None:
+            return
+        try:
+            await self._client.set(f"np:ai:cooldown:{proxy_id}", "1", ex=int(ttl))
+        except Exception as exc:
+            self._log_degraded_once("AI_COOLDOWN_SET", exc)
+
+    async def is_ai_proxy_in_cooldown(self, proxy_id: str) -> bool:
+        if not self.is_connected or self._client is None:
+            return False
+        try:
+            return bool(await self._client.exists(f"np:ai:cooldown:{proxy_id}"))
+        except Exception as exc:
+            self._log_degraded_once("AI_COOLDOWN_GET", exc)
+            return False

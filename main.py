@@ -259,6 +259,20 @@ async def lifespan(_app: FastAPI):
         replace_existing=True,
     )
 
+    from ai_proxy_pool import AIProxyPool
+    from agent_engine import NexaAgentEngine
+
+    ai_proxy_pool = AIProxyPool(cache=redis_cache)
+    agent_engine = NexaAgentEngine(
+        db=db_store,
+        cache=redis_cache,
+        manager=userbot_manager,
+        proxy_pool=ai_proxy_pool,
+        bot=None,
+    )
+    userbot_manager.set_agent_engine(agent_engine)
+    logger.info("AI Proxy Pool initialized with %d proxy server(s).", len(ai_proxy_pool.nodes))
+
     # Start ftmgram controller bot BEFORE restoring userbots so revocation alerts deliver immediately
     bot_token = os.environ.get("BOT_TOKEN", "").strip()
     if bot_token:
@@ -272,9 +286,11 @@ async def lifespan(_app: FastAPI):
                 db=db_store,
                 manager=userbot_manager,
                 cache=redis_cache,
+                agent_engine=agent_engine,
             )
             await nexapilot_bot.start()
             userbot_manager.set_bot(nexapilot_bot)
+            agent_engine.set_bot(nexapilot_bot)
         except Exception as exc:
             logger.exception("Failed to start NexaPilot ftmgram bot: %s", exc)
             nexapilot_bot = None
@@ -288,10 +304,11 @@ async def lifespan(_app: FastAPI):
         bot=nexapilot_bot,
         api_id=config["api_id"],
         api_hash=config["api_hash"],
+        agent_engine=agent_engine,
     )
 
     async def _restore_userbots_background() -> None:
-        """Restore Kurigram sessions, schedules, and campaigns without blocking Uvicorn port binding."""
+        """Restore Kurigram sessions, schedules, campaigns & agent tasks without blocking Uvicorn port binding."""
         assert userbot_manager is not None
         try:
             logger.info("Background userbot restoration started...")
@@ -304,6 +321,10 @@ async def lifespan(_app: FastAPI):
                 await userbot_manager.reload_campaigns()
             except Exception as exc:
                 logger.exception("Failed to reload campaigns during startup: %s", exc)
+            try:
+                await userbot_manager.reload_agent_scheduled_tasks()
+            except Exception as exc:
+                logger.exception("Failed to reload AI agent scheduled tasks during startup: %s", exc)
             await userbot_manager.flush_pending_revoked_notifications()
             logger.info("Background userbot restoration complete.")
         except asyncio.CancelledError:
@@ -348,6 +369,8 @@ async def lifespan(_app: FastAPI):
 
         if userbot_manager is not None:
             await userbot_manager.stop_all_clients()
+
+        await ai_proxy_pool.close()
 
         if redis_cache is not None:
             await redis_cache.close()

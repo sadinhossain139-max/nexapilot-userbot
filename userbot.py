@@ -1325,6 +1325,129 @@ class SupabaseStore:
         )
         return res.data or []
 
+    # -- Autonomous AI Agent tables (agent_configs, agent_action_logs, agent_scheduled_tasks) --
+
+    async def get_agent_config(self, owner_user_id: int) -> dict[str, Any] | None:
+        try:
+            res = await self._run(
+                lambda: self._client.table("agent_configs")
+                .select("*")
+                .eq("owner_user_id", owner_user_id)
+                .limit(1)
+                .execute()
+            )
+            return res.data[0] if res.data else None
+        except Exception as exc:
+            logger.debug("get_agent_config skipped (ensure migrations/ai_agent.sql was run): %s", exc)
+            return None
+
+    async def upsert_agent_config(
+        self, owner_user_id: int, config_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        payload = {
+            **config_data,
+            "owner_user_id": int(owner_user_id),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        res = await self._run(
+            lambda: self._client.table("agent_configs")
+            .upsert(payload, on_conflict="owner_user_id")
+            .execute()
+        )
+        return res.data[0] if res.data else payload
+
+    async def create_agent_action_log(
+        self,
+        *,
+        owner_user_id: int,
+        trigger_source: str,
+        tool_name: str,
+        arguments_summary: str,
+        status: str,
+        result_summary: str,
+    ) -> dict[str, Any] | None:
+        payload = {
+            "owner_user_id": int(owner_user_id),
+            "trigger_source": trigger_source,
+            "tool_name": tool_name,
+            "arguments_summary": arguments_summary[:300],
+            "status": status,
+            "result_summary": result_summary[:400],
+        }
+        try:
+            res = await self._run(
+                lambda: self._client.table("agent_action_logs").insert(payload).execute()
+            )
+            return res.data[0] if res.data else payload
+        except Exception as exc:
+            logger.debug("create_agent_action_log skipped: %s", exc)
+            return None
+
+    async def list_agent_action_logs(
+        self, owner_user_id: int, limit: int = 15
+    ) -> list[dict[str, Any]]:
+        try:
+            res = await self._run(
+                lambda: self._client.table("agent_action_logs")
+                .select("*")
+                .eq("owner_user_id", owner_user_id)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return res.data or []
+        except Exception as exc:
+            logger.debug("list_agent_action_logs skipped: %s", exc)
+            return []
+
+    async def create_agent_scheduled_task(
+        self,
+        *,
+        owner_user_id: int,
+        telegram_user_id: int,
+        target_chat: str,
+        message_text: str,
+        run_at: datetime,
+    ) -> dict[str, Any]:
+        payload = {
+            "owner_user_id": int(owner_user_id),
+            "telegram_user_id": int(telegram_user_id),
+            "target_chat": str(target_chat),
+            "message_text": message_text,
+            "run_at": run_at.astimezone(timezone.utc).isoformat(),
+            "status": "pending",
+        }
+        res = await self._run(
+            lambda: self._client.table("agent_scheduled_tasks").insert(payload).execute()
+        )
+        return res.data[0] if res.data else payload
+
+    async def list_pending_agent_scheduled_tasks(self) -> list[dict[str, Any]]:
+        try:
+            res = await self._run(
+                lambda: self._client.table("agent_scheduled_tasks")
+                .select("*")
+                .eq("status", "pending")
+                .execute()
+            )
+            return res.data or []
+        except Exception as exc:
+            logger.debug("list_pending_agent_scheduled_tasks skipped: %s", exc)
+            return []
+
+    async def update_agent_scheduled_task(
+        self, task_id: int, updates: dict[str, Any]
+    ) -> None:
+        try:
+            await self._run(
+                lambda: self._client.table("agent_scheduled_tasks")
+                .update(updates)
+                .eq("id", int(task_id))
+                .execute()
+            )
+        except Exception as exc:
+            logger.debug("update_agent_scheduled_task skipped: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Pyrogram / Kurigram In-Memory Userbot Manager
@@ -1380,14 +1503,122 @@ class UserbotManager:
         # Per-account send lock so multiple simultaneous campaigns pace safely
         self._account_send_locks: dict[int, asyncio.Lock] = {}
 
-        # Controller bot reference & dead-session notification queue / re-entrancy guard
+        # Controller bot reference, AI Agent engine & dead-session notification queue / re-entrancy guard
         self._bot_ref: Any = None
+        self._agent_engine: Any = None
         self._pending_revoked_notices: list[tuple[int, int, str]] = []
         self._revoking_users: set[int] = set()
 
     def set_bot(self, bot: Any) -> None:
         """Attach the ftmgram NexaPilotBot instance for user logout/revocation alerts."""
         self._bot_ref = bot
+
+    def set_agent_engine(self, engine: Any) -> None:
+        """Attach the NexaAgentEngine for autonomous incoming message handling."""
+        self._agent_engine = engine
+
+    def register_agent_task_job(self, row: dict[str, Any]) -> None:
+        """Schedule a persistent one-time agent_scheduled_tasks row in APScheduler."""
+        task_id = row.get("id")
+        if task_id is None or self.scheduler is None:
+            return
+        raw_run = row.get("run_at")
+        if not raw_run:
+            return
+        try:
+            run_dt = (
+                raw_run
+                if isinstance(raw_run, datetime)
+                else datetime.fromisoformat(str(raw_run).replace("Z", "+00:00"))
+            )
+            if run_dt.tzinfo is None:
+                run_dt = run_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return
+        self.scheduler.add_job(
+            self._execute_agent_scheduled_task,
+            trigger=DateTrigger(run_date=run_dt, timezone=timezone.utc),
+            args=[
+                int(task_id),
+                int(row["owner_user_id"]),
+                int(row.get("telegram_user_id") or 0),
+                str(row["target_chat"]),
+                str(row["message_text"]),
+            ],
+            id=f"agent_task_{task_id}",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+
+    async def reload_agent_scheduled_tasks(self) -> None:
+        """Reload pending one-time AI Agent scheduled messages into APScheduler on startup."""
+        rows = await self.db.list_pending_agent_scheduled_tasks()
+        now = datetime.now(timezone.utc)
+        loaded = 0
+        for row in rows:
+            try:
+                raw_run = row.get("run_at")
+                run_dt = datetime.fromisoformat(str(raw_run).replace("Z", "+00:00"))
+                if run_dt.tzinfo is None:
+                    run_dt = run_dt.replace(tzinfo=timezone.utc)
+                if run_dt <= now:
+                    await self.db.update_agent_scheduled_task(
+                        int(row["id"]), {"status": "failed", "last_error": "Missed run window"}
+                    )
+                    continue
+                self.register_agent_task_job(row)
+                loaded += 1
+            except Exception as exc:
+                logger.debug("Skipping invalid agent_scheduled_tasks row %s: %s", row.get("id"), exc)
+        if loaded:
+            logger.info("Reloaded %d pending AI Agent scheduled task(s).", loaded)
+
+    async def _execute_agent_scheduled_task(
+        self,
+        task_id: int,
+        owner_user_id: int,
+        telegram_user_id: int,
+        target_chat: str,
+        message_text: str,
+    ) -> None:
+        from entitlements import is_user_plan_active
+
+        if not await is_user_plan_active(self.db, self.cache, owner_user_id):
+            await self.db.update_agent_scheduled_task(
+                task_id, {"status": "cancelled", "last_error": "Plan expired"}
+            )
+            return
+
+        uid = telegram_user_id
+        if not uid:
+            accounts = await self.db.get_owner_accounts(owner_user_id)
+            if accounts:
+                uid = int(accounts[0]["telegram_user_id"])
+        client = self.active_clients.get(uid)
+        if client is None:
+            await self.db.update_agent_scheduled_task(
+                task_id, {"status": "failed", "last_error": "Userbot offline"}
+            )
+            return
+
+        target: int | str = int(target_chat) if str(target_chat).lstrip("-").isdigit() else target_chat
+        try:
+            await client.send_message(chat_id=target, text=message_text, parse_mode=ParseMode.DISABLED)
+            await self.db.update_agent_scheduled_task(task_id, {"status": "sent", "last_error": None})
+            logger.info("Executed agent scheduled task #%s -> %s (owner=%s)", task_id, target, owner_user_id)
+        except DEAD_SESSION_ERRORS as exc:
+            await self.db.update_agent_scheduled_task(
+                task_id, {"status": "failed", "last_error": f"Session revoked: {type(exc).__name__}"}
+            )
+            await self.handle_session_revoked(
+                uid,
+                f"Agent scheduled task #{task_id}: {type(exc).__name__}",
+                owner_user_id=owner_user_id,
+            )
+        except Exception as exc:
+            await self.db.update_agent_scheduled_task(
+                task_id, {"status": "failed", "last_error": str(exc)[:240]}
+            )
 
     async def _notify_user_session_revoked(
         self, owner_user_id: int, telegram_user_id: int, reason: str
@@ -1416,7 +1647,7 @@ class UserbotManager:
             r.line("Your account slot is now free — reconnect anytime below.", icon="ok")
 
             rows: list[list[Any]] = [
-                [make_button("Reconnect Account", "np:acc:connect", "connect", style="success")]
+                [make_button("Reconnect Account", "np:acc:connect", "connect_otp", style="success")]
             ]
             mini_url = get_mini_app_url()
             if mini_url:
@@ -1424,7 +1655,7 @@ class UserbotManager:
                     [
                         make_button(
                             "Open NexaPilot App",
-                            icon="webapp",
+                            emoji_key="webapp",
                             style="primary",
                             web_app=WebAppInfo(url=mini_url),
                         )
@@ -2337,7 +2568,72 @@ class UserbotManager:
             ),
             group=4,
         )
-        logger.debug("Attached async message & status handlers for user_id=%s", telegram_user_id)
+
+        # Group 5: Autonomous AI Agent incoming message listener (non-blocking)
+        async def _on_ai_agent_incoming(c: Client, m: Message) -> None:
+            if self._agent_engine is None:
+                return
+            if not m.chat or not m.from_user:
+                return
+            if getattr(m.from_user, "is_bot", False) or getattr(m.from_user, "is_support", False):
+                return
+            sender_id = int(m.from_user.id)
+            if sender_id == telegram_user_id or sender_id in TELEGRAM_SYSTEM_USER_IDS:
+                return
+            text = (m.text or m.caption or "").strip()
+            if not text:
+                return
+            is_private = m.chat.type == ChatType.PRIVATE
+            if not is_private and not getattr(m, "mentioned", False):
+                return
+            if (telegram_user_id, int(m.chat.id), int(m.id)) in self._replied_messages:
+                return
+
+            if telegram_user_id not in self._owner_id_cache:
+                try:
+                    self._owner_id_cache[telegram_user_id] = await self.db.get_account_owner_id(
+                        telegram_user_id
+                    )
+                except Exception:
+                    return
+            owner_id = self._owner_id_cache.get(telegram_user_id)
+            if owner_id is None:
+                return
+
+            sender_name = (
+                " ".join(
+                    filter(
+                        None,
+                        [
+                            getattr(m.from_user, "first_name", ""),
+                            getattr(m.from_user, "last_name", ""),
+                        ],
+                    )
+                ).strip()
+                or getattr(m.from_user, "username", None)
+                or str(sender_id)
+            )
+            asyncio.create_task(
+                self._agent_engine.run_autonomous_incoming(
+                    owner_user_id=int(owner_id),
+                    telegram_user_id=telegram_user_id,
+                    chat_id=int(m.chat.id),
+                    chat_username=getattr(m.chat, "username", None),
+                    is_private=is_private,
+                    sender_name=sender_name,
+                    message_id=int(m.id),
+                    text=text,
+                )
+            )
+
+        client.add_handler(
+            MessageHandler(
+                _on_ai_agent_incoming,
+                (dm_filter | (filters.mentioned & ~filters.me & ~filters.bot)) & (filters.text | filters.caption),
+            ),
+            group=5,
+        )
+        logger.debug("Attached async message, status & AI agent handlers for user_id=%s", telegram_user_id)
 
     # -- Automation Handlers --
 
