@@ -480,17 +480,38 @@ class NexaPilotBot:
 
         rows: list[list[InlineKeyboardButton]] = []
         mini_url = get_mini_app_url()
+        is_admin = bool(ent.get("is_admin")) if ent else False
         if mini_url:
-            rows.append(
-                [
-                    make_button(
-                        "Open NexaPilot App",
-                        emoji_key="webapp",
-                        style="primary",
-                        web_app=WebAppInfo(url=mini_url),
-                    )
-                ]
-            )
+            if is_admin:
+                sep = "&" if "?" in mini_url else "?"
+                admin_url = f"{mini_url}{sep}open=admin"
+                rows.append(
+                    [
+                        make_button(
+                            "Open NexaPilot App",
+                            emoji_key="webapp",
+                            style="primary",
+                            web_app=WebAppInfo(url=mini_url),
+                        ),
+                        make_button(
+                            "Admin Panel",
+                            emoji_key="admin_panel",
+                            style="primary",
+                            web_app=WebAppInfo(url=admin_url),
+                        ),
+                    ]
+                )
+            else:
+                rows.append(
+                    [
+                        make_button(
+                            "Open NexaPilot App",
+                            emoji_key="webapp",
+                            style="primary",
+                            web_app=WebAppInfo(url=mini_url),
+                        )
+                    ]
+                )
         rows.extend(
             [
                 [
@@ -709,6 +730,7 @@ class NexaPilotBot:
             "trial": "trial",
             "premium": "premium",
             "ultra": "ultra",
+            "unlimited": "unlimited",
             "expired": "expired",
         }.get(ent["effective_plan"], "warn")
 
@@ -3099,7 +3121,10 @@ class NexaPilotBot:
                 ]
             ]
         )
-        for admin_id in ADMIN_USER_IDS:
+        from dynamic_config import get_all_admin_ids
+
+        all_admins = await get_all_admin_ids(self.db, self.cache)
+        for admin_id in all_admins:
             try:
                 if proof_file_id:
                     await self.client.send_photo(chat_id=admin_id, photo=proof_file_id)
@@ -3115,7 +3140,9 @@ class NexaPilotBot:
         *,
         approve: bool,
     ) -> None:
-        if admin_id not in ADMIN_USER_IDS:
+        from dynamic_config import is_admin_user
+
+        if not await is_admin_user(self.db, self.cache, admin_id):
             return
         pay = await self.db.get_payment_request(pay_id)
         if not pay:
@@ -3454,6 +3481,36 @@ class NexaPilotBot:
                     make_button("Back to AI Agent", "np:agent", "back", style="primary"),
                     make_button("Main Menu", "np:home", "home", style="primary"),
                 ],
+            ]
+        )
+        await self.edit_ui(cq, r, kb)
+
+    async def _show_upgrade_wall(
+        self,
+        cq: CallbackQuery,
+        owner_id: int,
+        feature_name: str,
+        required_plan: str = "premium",
+    ) -> None:
+        """Render a clean upgrade prompt when a user taps a plan-locked feature."""
+        req = str(required_plan or "premium").strip().lower()
+        plan_label = "Ultra Premium" if req == "ultra" else "Premium or Ultra Premium"
+        plan_icon = "ultra" if req == "ultra" else "premium"
+
+        r = RichText()
+        r.line(f"{feature_name} — Locked", icon="lock")
+        r.line("==================================")
+        r.line(
+            f"This feature requires an active {plan_label} plan.",
+            icon=plan_icon,
+        )
+        r.line("Upgrade now for instant access, or invite friends to earn free days!", icon="gift")
+
+        kb = InlineKeyboardMarkup(
+            [
+                [make_button("Upgrade / View Plans", "np:plans", "upgrade", style="success")],
+                [make_button("Refer & Earn Free Days", "np:ref", "referral", style="primary")],
+                [make_button("Back to Home", "np:home", "home", style="primary")],
             ]
         )
         await self.edit_ui(cq, r, kb)

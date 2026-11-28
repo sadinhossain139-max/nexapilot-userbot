@@ -1019,6 +1019,17 @@ class NexaAgentEngine:
     async def _execute_billing_tool(
         self, owner_user_id: int, tool_name: str, args: dict[str, Any]
     ) -> dict[str, Any]:
+        from dynamic_config import (
+            get_all_admin_ids,
+            get_all_settings,
+            get_dynamic_payment_methods,
+            get_dynamic_plans,
+        )
+
+        settings = await get_all_settings(self.db, self.cache)
+        dyn_plans = get_dynamic_plans(settings)
+        dyn_methods = get_dynamic_payment_methods(settings)
+
         if tool_name == "get_plans_and_payment_methods":
             ent = await get_user_entitlement(self.db, self.cache, owner_user_id)
             return {
@@ -1026,12 +1037,12 @@ class NexaAgentEngine:
                 "current_plan": ent["effective_plan"],
                 "remaining_time": ent["remaining_text"],
                 "plans": {
-                    "trial": PLANS["trial"],
-                    "premium": PLANS["premium"],
-                    "ultra": PLANS["ultra"],
+                    "trial": dyn_plans["trial"],
+                    "premium": dyn_plans["premium"],
+                    "ultra": dyn_plans["ultra"],
                 },
-                "payment_methods": get_configured_payment_methods(),
-                "message": "Fetched live plans and ENV-configured payment methods.",
+                "payment_methods": dyn_methods,
+                "message": "Fetched live plans and dynamic receiving payment methods.",
             }
 
         if tool_name == "submit_payment_request":
@@ -1040,13 +1051,13 @@ class NexaAgentEngine:
             trx_id = str(args.get("trx_id") or "").strip()
             if plan_type not in ("premium", "ultra"):
                 return {"ok": False, "error": "INVALID_PLAN", "message": "plan_type must be 'premium' or 'ultra'."}
-            method = get_payment_method(method_key)
+            method = next((m for m in dyn_methods if m["key"] == method_key), None)
             if not method:
                 return {"ok": False, "error": "INVALID_METHOD", "message": f"Payment method '{method_key}' is not configured."}
             if len(trx_id) < 2:
                 return {"ok": False, "error": "INVALID_TRX", "message": "Valid TrxID is required."}
 
-            cfg_plan = get_plan_config(plan_type)
+            cfg_plan = dyn_plans[plan_type]
             amount_display = (
                 f"৳{cfg_plan['price_bdt']} BDT"
                 if method["currency"] == "BDT"
@@ -1061,8 +1072,8 @@ class NexaAgentEngine:
                 trx_id=trx_id,
             )
 
-            # Notify admins with existing Green Approve / Red Reject buttons
-            if self.bot is not None and getattr(self.bot, "is_running", False) and ADMIN_USER_IDS:
+            all_admins = await get_all_admin_ids(self.db, self.cache)
+            if self.bot is not None and getattr(self.bot, "is_running", False) and all_admins:
                 from ftmgram.types import InlineKeyboardMarkup
                 from emojis import RichText, make_button
 
@@ -1088,7 +1099,7 @@ class NexaAgentEngine:
                         ]
                     ]
                 )
-                for admin_id in ADMIN_USER_IDS:
+                for admin_id in all_admins:
                     try:
                         await self.bot.send_ui(admin_id, r_adm, adm_kb)
                     except Exception:
@@ -1110,9 +1121,9 @@ class NexaAgentEngine:
                 "ok": True,
                 "referral_link": ref_link,
                 "referral_count": ent["referral_count"],
-                "referrals_required": REFERRALS_REQUIRED,
-                "reward_days": REFERRAL_REWARD_DAYS,
-                "reward_plan": REFERRAL_REWARD_PLAN,
+                "referrals_required": int(settings.get("REFERRALS_REQUIRED", REFERRALS_REQUIRED)),
+                "reward_days": int(settings.get("REFERRAL_REWARD_DAYS", REFERRAL_REWARD_DAYS)),
+                "reward_plan": str(settings.get("REFERRAL_REWARD_PLAN", REFERRAL_REWARD_PLAN)),
                 "rewards_claimed": ent["referral_rewards_claimed"],
                 "message": "Fetched live referral status.",
             }

@@ -150,6 +150,9 @@
 
   // Countdown Formatter
   function formatCountdown(isoStr) {
+    if (state.boot && state.boot.entitlement && state.boot.entitlement.effective_plan === "unlimited") {
+      return "Never Expires";
+    }
     if (!isoStr) return "Inactive";
     const target = Date.parse(isoStr);
     if (Number.isNaN(target)) return "Inactive";
@@ -176,6 +179,7 @@
   // Plan Pill Helper
   function planBadgeHtml(plan) {
     const p = String(plan || "free").toLowerCase();
+    if (p === "unlimited") return `<span class="pill pill-admin">${I("crown", 13)} UNLIMITED (ADMIN)</span>`;
     if (p === "ultra") return `<span class="pill pill-gold">${I("crown", 13)} Ultra Premium</span>`;
     if (p === "premium") return `<span class="pill pill-blue">${I("bolt", 13)} Premium</span>`;
     if (p === "trial") return `<span class="pill pill-emerald">${I("gift", 13)} Starter Trial</span>`;
@@ -233,6 +237,11 @@
         state.payments = null;
         state.referrals = null;
       }
+      // Deep-link ?open=admin strictly verified against server is_admin flag
+      if (!refresh && data.is_admin === true) {
+        const qp = new URLSearchParams(window.location.search);
+        if (qp.get("open") === "admin") state.adminMode = true;
+      }
       const user = data.user || {};
       $("brand-sub").textContent = user.username ? `@${user.username}` : user.first_name || "Control Center";
       render();
@@ -258,6 +267,23 @@
   function render() {
     if (!state.boot) return;
     const { force_join, entitlement } = state.boot;
+
+    // Full-screen Zero-Trust Admin Panel workspace (ONLY when server bootstrap confirms is_admin)
+    if (state.adminMode && state.boot.is_admin === true && window.NexaAdmin) {
+      renderBottomNav(false);
+      window.NexaAdmin.mount({
+        toast,
+        haptic,
+        copyText,
+        openSheet,
+        closeSheet,
+        exitAdmin: () => {
+          state.adminMode = false;
+          loadBootstrap(true);
+        },
+      });
+      return;
+    }
 
     // Gate 1: Force-Join Channel
     if (force_join && force_join.required) {
@@ -422,6 +448,10 @@
         </div>
       </div>
 
+      ${state.boot.is_admin === true
+        ? `<button id="dash-open-admin" class="btn btn-admin-glow btn-full" style="margin-bottom:12px;" type="button">${I("shield", 16)} Open Admin Panel</button>`
+        : ""}
+
       <section class="card card-hero" style="margin-bottom:12px;">
         <div class="card-header" style="margin-bottom:8px;">
           <h3 class="card-title">${I("bot", 18)} Autonomous AI Agent</h3>
@@ -437,6 +467,15 @@
         <button id="dash-go-cmp" class="btn btn-blue" type="button">${I("megaphone", 16)} Campaigns</button>
         <button id="dash-go-ref" class="btn btn-ghost" type="button">${I("users", 16)} Refer & Earn</button>
       </div>`;
+
+    const admBtn = $("dash-open-admin");
+    if (admBtn) {
+      admBtn.addEventListener("click", () => {
+        haptic("medium");
+        state.adminMode = true;
+        render();
+      });
+    }
 
     const up = $("dash-upgrade");
     if (up) up.addEventListener("click", () => { state.tab = "plans"; render(); });

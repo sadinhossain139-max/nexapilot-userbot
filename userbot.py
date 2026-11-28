@@ -1448,6 +1448,130 @@ class SupabaseStore:
         except Exception as exc:
             logger.debug("update_agent_scheduled_task skipped: %s", exc)
 
+    # -- Admin Panel tables (admin_users, app_settings, admin_audit_logs) --
+
+    async def list_admin_users(self) -> list[dict[str, Any]]:
+        try:
+            res = await self._run(
+                lambda: self._client.table("admin_users").select("*").order("created_at").execute()
+            )
+            return res.data or []
+        except Exception as exc:
+            logger.debug("list_admin_users skipped (ensure migrations/admin_panel.sql was run): %s", exc)
+            return []
+
+    async def upsert_admin_user(
+        self,
+        telegram_user_id: int,
+        *,
+        role: str = "admin",
+        note: str | None = None,
+        added_by: int | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "telegram_user_id": int(telegram_user_id),
+            "role": role,
+            "note": (note or "")[:200] or None,
+            "added_by": int(added_by) if added_by is not None else None,
+        }
+        res = await self._run(
+            lambda: self._client.table("admin_users")
+            .upsert(payload, on_conflict="telegram_user_id")
+            .execute()
+        )
+        return res.data[0] if res.data else payload
+
+    async def delete_admin_user(self, telegram_user_id: int) -> bool:
+        res = await self._run(
+            lambda: self._client.table("admin_users")
+            .delete()
+            .eq("telegram_user_id", int(telegram_user_id))
+            .execute()
+        )
+        return bool(res.data)
+
+    async def list_app_settings(self) -> list[dict[str, Any]]:
+        try:
+            res = await self._run(
+                lambda: self._client.table("app_settings").select("*").execute()
+            )
+            return res.data or []
+        except Exception as exc:
+            logger.debug("list_app_settings skipped (ensure migrations/admin_panel.sql was run): %s", exc)
+            return []
+
+    async def upsert_app_setting(
+        self, key: str, value: Any, *, updated_by: int | None = None
+    ) -> dict[str, Any]:
+        payload = {
+            "key": key,
+            "value": value,
+            "updated_by": int(updated_by) if updated_by is not None else None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        res = await self._run(
+            lambda: self._client.table("app_settings")
+            .upsert(payload, on_conflict="key")
+            .execute()
+        )
+        return res.data[0] if res.data else payload
+
+    async def create_admin_audit_log(
+        self,
+        *,
+        admin_user_id: int,
+        action: str,
+        target_user_id: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            payload = {
+                "admin_user_id": int(admin_user_id),
+                "action": action,
+                "target_user_id": int(target_user_id) if target_user_id is not None else None,
+                "details": details or {},
+            }
+            await self._run(
+                lambda: self._client.table("admin_audit_logs").insert(payload).execute()
+            )
+        except Exception as exc:
+            logger.debug("create_admin_audit_log skipped: %s", exc)
+
+    async def list_all_bot_users(self, limit: int = 500) -> list[dict[str, Any]]:
+        try:
+            res = await self._run(
+                lambda: self._client.table("bot_users")
+                .select("*")
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return res.data or []
+        except Exception as exc:
+            logger.debug("list_all_bot_users failed: %s", exc)
+            return []
+
+    async def list_payment_requests_by_status(
+        self, status_filter: str = "pending", limit: int = 50
+    ) -> list[dict[str, Any]]:
+        try:
+            def _q():
+                q = (
+                    self._client.table("payment_requests")
+                    .select("*")
+                    .order("created_at", desc=True)
+                    .limit(limit)
+                )
+                if status_filter and status_filter != "all":
+                    q = q.eq("status", status_filter)
+                return q.execute()
+
+            res = await self._run(_q)
+            return res.data or []
+        except Exception as exc:
+            logger.debug("list_payment_requests_by_status failed: %s", exc)
+            return []
+
 
 # ---------------------------------------------------------------------------
 # Pyrogram / Kurigram In-Memory Userbot Manager

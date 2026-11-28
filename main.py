@@ -52,6 +52,10 @@ from webapp_api import (
     configure_webapp_runtime,
     router as webapp_router,
 )
+from admin_api import (
+    configure_admin_runtime,
+    router as admin_router,
+)
 
 LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
@@ -306,6 +310,13 @@ async def lifespan(_app: FastAPI):
         api_hash=config["api_hash"],
         agent_engine=agent_engine,
     )
+    configure_admin_runtime(
+        db=db_store,
+        cache=redis_cache,
+        manager=userbot_manager,
+        bot=nexapilot_bot,
+        proxy_pool=ai_proxy_pool,
+    )
 
     async def _restore_userbots_background() -> None:
         """Restore Kurigram sessions, schedules, campaigns & agent tasks without blocking Uvicorn port binding."""
@@ -380,12 +391,13 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="NexaPilot — Telegram Userbot Automation Server",
-    version="2.2.0",
+    version="2.4.0",
     lifespan=lifespan,
 )
 
-# Mount NexaPilot Mini App API & static SPA (/app)
+# Mount NexaPilot Mini App API, Zero-Trust Admin API & static SPA (/app)
 app.include_router(webapp_router)
+app.include_router(admin_router)
 
 WEBAPP_DIR = Path(__file__).resolve().parent / "webapp"
 

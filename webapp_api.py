@@ -342,10 +342,23 @@ async def webapp_bootstrap(
     if refresh and cache is not None:
         await cache.invalidate_user_cache(owner_id)
 
+    from dynamic_config import (
+        get_all_settings,
+        get_dynamic_force_join_info,
+        get_dynamic_payment_methods,
+    )
+
     ent = await get_user_entitlement(db, cache, owner_id, force_fresh=refresh)
-    chat_ref, join_url = get_force_join_info()
+    if ent.get("is_banned"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been suspended by an administrator.",
+        )
+
+    settings = await get_all_settings(db, cache)
+    chat_ref, join_url = get_dynamic_force_join_info(settings)
     force_join_required = False
-    if chat_ref and not ent["channel_verified"]:
+    if chat_ref and not ent["channel_verified"] and not ent.get("is_admin"):
         if bot is not None and bot.is_running:
             is_member = await bot._is_channel_member(owner_id)
             if is_member:
@@ -402,6 +415,8 @@ async def webapp_bootstrap(
             "username": user.get("username"),
             "first_name": user.get("first_name"),
         },
+        "is_admin": bool(ent.get("is_admin", False)),
+        "is_super_admin": bool(ent.get("is_super_admin", False)),
         "force_join": {
             "required": force_join_required,
             "channel": chat_ref,
@@ -411,7 +426,7 @@ async def webapp_bootstrap(
         "slots_used": len(accounts),
         "account": account_summary,
         "counts": counts,
-        "payment_methods": get_configured_payment_methods(),
+        "payment_methods": get_dynamic_payment_methods(settings),
         "bot_username": getattr(bot, "bot_username", "") if bot else "",
         "timezone": manager.tz.key,
     }
@@ -1114,18 +1129,21 @@ async def webapp_delete_schedule(
 async def webapp_referrals(
     user: dict[str, Any] = Depends(get_verified_user),
 ) -> dict[str, Any]:
+    from dynamic_config import get_all_settings
+
     db, cache, _, bot = _get_runtime()
     owner_id = user["owner_user_id"]
     ent = await get_user_entitlement(db, cache, owner_id)
+    settings = await get_all_settings(db, cache)
     bot_uname = getattr(bot, "bot_username", "") if bot else ""
     ref_link = f"https://t.me/{bot_uname}?start=ref_{owner_id}" if bot_uname else f"ref_{owner_id}"
     return {
         "referral_link": ref_link,
         "referral_count": ent["referral_count"],
         "referral_rewards_claimed": ent["referral_rewards_claimed"],
-        "referrals_required": REFERRALS_REQUIRED,
-        "reward_days": REFERRAL_REWARD_DAYS,
-        "reward_plan": REFERRAL_REWARD_PLAN,
+        "referrals_required": int(settings.get("REFERRALS_REQUIRED", REFERRALS_REQUIRED)),
+        "reward_days": int(settings.get("REFERRAL_REWARD_DAYS", REFERRAL_REWARD_DAYS)),
+        "reward_plan": str(settings.get("REFERRAL_REWARD_PLAN", REFERRAL_REWARD_PLAN)),
     }
 
 
@@ -1133,17 +1151,21 @@ async def webapp_referrals(
 async def webapp_plans(
     user: dict[str, Any] = Depends(get_verified_user),
 ) -> dict[str, Any]:
+    from dynamic_config import get_all_settings, get_dynamic_payment_methods, get_dynamic_plans
+
     db, cache, _, _ = _get_runtime()
     owner_id = user["owner_user_id"]
     ent = await get_user_entitlement(db, cache, owner_id)
+    settings = await get_all_settings(db, cache)
+    dyn_plans = get_dynamic_plans(settings)
     return {
         "current_plan": ent["effective_plan"],
         "plans": {
-            "trial": PLANS["trial"],
-            "premium": PLANS["premium"],
-            "ultra": PLANS["ultra"],
+            "trial": dyn_plans["trial"],
+            "premium": dyn_plans["premium"],
+            "ultra": dyn_plans["ultra"],
         },
-        "payment_methods": get_configured_payment_methods(),
+        "payment_methods": get_dynamic_payment_methods(settings),
     }
 
 
@@ -1152,10 +1174,21 @@ async def webapp_submit_payment(
     payload: WebAppPaymentSubmitReq,
     user: dict[str, Any] = Depends(get_verified_user),
 ) -> dict[str, Any]:
+    from dynamic_config import (
+        get_all_admin_ids,
+        get_all_settings,
+        get_dynamic_payment_methods,
+        get_dynamic_plans,
+    )
+
     db, cache, _, bot = _get_runtime()
     owner_id = user["owner_user_id"]
-    cfg = get_plan_config(payload.plan_type)
-    method = get_payment_method(payload.payment_method)
+    settings = await get_all_settings(db, cache)
+    dyn_plans = get_dynamic_plans(settings)
+    dyn_methods = get_dynamic_payment_methods(settings)
+
+    cfg = dyn_plans[payload.plan_type]
+    method = next((m for m in dyn_methods if m["key"] == payload.payment_method.strip().lower()), None)
     if not method:
         raise HTTPException(status_code=400, detail="Payment method is not configured.")
 
@@ -1174,8 +1207,9 @@ async def webapp_submit_payment(
         proof_file_id=payload.screenshot_name,
     )
 
-    # Notify admins on Telegram with existing Green Approve / Red Reject inline buttons
-    if bot is not None and bot.is_running and ADMIN_USER_IDS:
+    # Notify ALL admins (ENV Super Admins + Supabase dynamic admins)
+    all_admins = await get_all_admin_ids(db, cache)
+    if bot is not None and bot.is_running and all_admins:
         from ftmgram.types import InlineKeyboardMarkup
         from emojis import RichText, make_button
 
@@ -1200,7 +1234,7 @@ async def webapp_submit_payment(
                 ]
             ]
         )
-        for admin_id in ADMIN_USER_IDS:
+        for admin_id in all_admins:
             try:
                 await bot.send_ui(admin_id, r_adm, adm_kb)
             except Exception as exc:

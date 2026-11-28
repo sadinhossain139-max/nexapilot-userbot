@@ -849,4 +849,53 @@ html, body {
   color: var(--text-dim);
 }
 
+/* Zero-Trust Admin Panel Styles */
+.pill-admin {
+  background: rgba(139, 92, 246, 0.18);
+  color: #C4B5FD;
+  border: 1px solid rgba(139, 92, 246, 0.42);
+}
+
+.btn-admin-glow {
+  background: linear-gradient(135deg, #7C3AED 0%, #D97706 100%);
+  color: #FFFFFF;
+  box-shadow: 0 4px 18px rgba(124, 58, 237, 0.35);
+}
+
+.admin-header-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.admin-tabs {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 4px;
+  margin-bottom: 14px;
+}
+
+.admin-tabs .seg-btn {
+  padding: 7px 4px;
+  font-size: 11.5px;
+}
+
+.proxy-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+
+.proxy-item {
+  background: rgba(11, 15, 25, 0.72);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+}
+
 .hidden { display: none !important; }

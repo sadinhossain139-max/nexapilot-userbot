@@ -63,6 +63,9 @@ TEXT_EMOJIS: dict[str, tuple[str, int]] = {
     "ai_react": ("😀", int(os.environ.get("NEXA_EMOJI_AI_REACT", "5935824500208702046"))),        # VERIFIED
     "ai_task_done": ("👍", int(os.environ.get("NEXA_EMOJI_AI_DONE", "5323547156630483403"))),     # VERIFIED
     "ai_log": ("📋", int(os.environ.get("NEXA_EMOJI_AI_LOG", "5886223731088431288"))),            # VERIFIED
+    # Admin Panel & Unlimited Plan Text Emojis (PLACEHOLDER)
+    "admin_shield": ("🛡️", int(os.environ.get("NEXA_EMOJI_ADMIN_SHIELD", "5776159202649051327"))),  # PLACEHOLDER
+    "unlimited": ("👑", int(os.environ.get("NEXA_EMOJI_UNLIMITED", "5368493353727968677"))),        # PLACEHOLDER
 }
 
 BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
@@ -137,6 +140,8 @@ BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
     "ai_perm_on": ("🟢", int(os.environ.get("NEXA_BTN_AI_PERM_ON", "5832572966721818453"))),
     "ai_perm_off": ("🙅‍♂️", int(os.environ.get("NEXA_BTN_AI_PERM_OFF", "5924497670721769339"))),
     "ai_exit": ("🕶️", int(os.environ.get("NEXA_BTN_AI_EXIT", "5467470746215292572"))),
+    # Admin Panel Button (PLACEHOLDER)
+    "admin_panel": ("🛡️", int(os.environ.get("NEXA_BTN_ADMIN_PANEL", "5807952667992920776"))),
 }
 
 

@@ -315,3 +315,42 @@ class RedisCache:
         except Exception as exc:
             self._log_degraded_once("AI_COOLDOWN_GET", exc)
             return False
+
+    async def clear_ai_proxy_cooldowns(self, proxy_ids: Iterable[str]) -> None:
+        if not self.is_connected or self._client is None:
+            return
+        keys = [f"np:ai:cooldown:{pid}" for pid in proxy_ids]
+        if not keys:
+            return
+        try:
+            await self._client.delete(*keys)
+        except Exception as exc:
+            self._log_degraded_once("AI_COOLDOWN_CLEAR", exc)
+
+    # -- System-Wide Cache Helpers (np:sys:settings, np:sys:admins, np:sys:admin_overview) --
+
+    async def get_sys_cache(self, key: str) -> Any | None:
+        if not self.is_connected or self._client is None:
+            return None
+        try:
+            raw = await self._client.get(key)
+            return json.loads(raw) if raw is not None else None
+        except Exception as exc:
+            self._log_degraded_once("SYS_GET", exc)
+            return None
+
+    async def set_sys_cache(self, key: str, value: Any, ttl: int = 300) -> None:
+        if not self.is_connected or self._client is None:
+            return
+        try:
+            await self._client.set(key, json.dumps(value, default=str), ex=int(ttl))
+        except Exception as exc:
+            self._log_degraded_once("SYS_SET", exc)
+
+    async def delete_sys_cache(self, *keys: str) -> None:
+        if not self.is_connected or self._client is None or not keys:
+            return
+        try:
+            await self._client.delete(*keys)
+        except Exception as exc:
+            self._log_degraded_once("SYS_DEL", exc)
