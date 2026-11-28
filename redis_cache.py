@@ -327,6 +327,63 @@ class RedisCache:
         except Exception as exc:
             self._log_degraded_once("AI_COOLDOWN_CLEAR", exc)
 
+    async def incr_ai_proxy_req_count(self, proxy_id: str) -> int:
+        if not hasattr(self, "_mem_proxy_counts"):
+            self._mem_proxy_counts: dict[str, int] = {}
+        self._mem_proxy_counts[proxy_id] = self._mem_proxy_counts.get(proxy_id, 0) + 1
+        if self.is_connected and self._client is not None:
+            try:
+                val = await self._client.incr(f"np:ai:req_count:{proxy_id}")
+                return int(val)
+            except Exception as exc:
+                self._log_degraded_once("AI_REQ_COUNT_INCR", exc)
+        return self._mem_proxy_counts[proxy_id]
+
+    async def get_ai_proxy_req_counts(self, proxy_ids: Iterable[str]) -> dict[str, int]:
+        ids = list(proxy_ids)
+        mem = getattr(self, "_mem_proxy_counts", {})
+        if not ids:
+            return {}
+        if self.is_connected and self._client is not None:
+            try:
+                keys = [f"np:ai:req_count:{pid}" for pid in ids]
+                vals = await self._client.mget(*keys)
+                return {
+                    pid: int(v) if v is not None else int(mem.get(pid, 0))
+                    for pid, v in zip(ids, vals)
+                }
+            except Exception as exc:
+                self._log_degraded_once("AI_REQ_COUNT_GET", exc)
+        return {pid: int(mem.get(pid, 0)) for pid in ids}
+
+    async def acquire_agent_dedup(
+        self, owner_user_id: int, chat_id: int, message_id: int, ttl: int = 120
+    ) -> bool:
+        """
+        Atomic deduplication lock (SET np:agent:dedup:{owner}:{chat}:{msg} 1 NX EX 120)
+        so duplicate Telegram updates can NEVER trigger two autonomous replies.
+        """
+        key = f"np:agent:dedup:{int(owner_user_id)}:{int(chat_id)}:{int(message_id)}"
+        if self.is_connected and self._client is not None:
+            try:
+                ok = await self._client.set(key, "1", ex=int(ttl), nx=True)
+                return bool(ok)
+            except Exception as exc:
+                self._log_degraded_once("AGENT_DEDUP", exc)
+
+        if not hasattr(self, "_mem_dedup"):
+            self._mem_dedup: dict[str, float] = {}
+        now = time.monotonic()
+        # Prune stale entries lazily
+        if len(self._mem_dedup) > 500:
+            for k, exp in list(self._mem_dedup.items()):
+                if exp <= now:
+                    self._mem_dedup.pop(k, None)
+        if self._mem_dedup.get(key, 0.0) > now:
+            return False
+        self._mem_dedup[key] = now + ttl
+        return True
+
     # -- System-Wide Cache Helpers (np:sys:settings, np:sys:admins, np:sys:admin_overview) --
 
     async def get_sys_cache(self, key: str) -> Any | None:

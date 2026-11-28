@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS public.agent_configs (
     perm_react           BOOLEAN NOT NULL DEFAULT FALSE,
     perm_control_server  BOOLEAN NOT NULL DEFAULT FALSE,
     perm_billing_actions BOOLEAN NOT NULL DEFAULT FALSE,
+    perm_manage_account  BOOLEAN NOT NULL DEFAULT FALSE,
 
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()

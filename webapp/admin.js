@@ -157,7 +157,8 @@ window.NexaAdmin = (function () {
                       <span class="mono" style="font-weight:700;">${esc(p.id.toUpperCase())}</span>
                       <span class="pill ${p.in_cooldown ? "pill-crimson" : "pill-emerald"}">${p.in_cooldown ? "Cooldown" : "Healthy"}</span>
                     </div>
-                    <div class="mono" style="font-size:10.5px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:4px;">${esc(p.url)}</div>
+                    <div class="mono" style="font-size:11px;color:var(--text-muted);margin-top:4px;">Served: <strong>${p.requests_served ?? 0}</strong></div>
+                    <div class="mono" style="font-size:10.5px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px;">${esc(p.url)}</div>
                   </div>`
                   )
                   .join("")}

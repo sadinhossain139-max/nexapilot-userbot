@@ -2198,12 +2198,13 @@ class NexaPilotBot:
             if flow == "pay_proof":
                 await self._step_pay_proof(owner_id, chat_id, message, state)
                 return
+            if flow == "agent_chat" and (message.text or message.photo):
+                await self._step_agent_chat(owner_id, chat_id, message)
+                return
             if not message.text:
                 return
             if flow == "login_phone":
                 await self._step_login_phone(owner_id, chat_id, text)
-            elif flow == "agent_chat":
-                await self._step_agent_chat(owner_id, chat_id, text)
             elif flow in ("agent_prompt_set", "agent_rules_set"):
                 await self._step_agent_prompt_or_rules(owner_id, chat_id, text, flow)
             elif flow == "login_otp":
@@ -3428,15 +3429,37 @@ class NexaPilotBot:
         )
         await self.edit_ui(cq, r, kb)
 
-    async def _step_agent_chat(self, owner_id: int, chat_id: int, text: str) -> None:
+    async def _step_agent_chat(self, owner_id: int, chat_id: int, message: Message) -> None:
         if self.agent_engine is None:
             return
-        res = await self.agent_engine.run_agent_chat(
-            owner_id,
-            text,
-            trigger_source="bot_chat",
-            chat_key="bot",
-        )
+        text = (message.text or message.caption or "").strip()
+        temp_photo_path: str | None = None
+        try:
+            if getattr(message, "photo", None):
+                import tempfile
+
+                tmp_dir = tempfile.gettempdir()
+                dl_path = os.path.join(tmp_dir, f"np_agent_photo_{owner_id}_{message.id}.jpg")
+                downloaded = await self.client.download_media(message, file_name=dl_path)
+                if downloaded and os.path.isfile(str(downloaded)):
+                    temp_photo_path = str(downloaded)
+                if not text:
+                    text = "I attached a photo. Set this as my profile photo if appropriate or ask me what to do."
+
+            res = await self.agent_engine.run_agent_chat(
+                owner_id,
+                text,
+                trigger_source="bot_chat",
+                chat_key="bot",
+                attached_photo_path=temp_photo_path,
+            )
+        finally:
+            if temp_photo_path and os.path.isfile(temp_photo_path):
+                try:
+                    os.remove(temp_photo_path)
+                except Exception:
+                    pass
+
         # Keep agent chat FSM alive until user taps Exit
         await self.cache.set_fsm(owner_id, {"flow": "agent_chat"}, ttl=1800)
         r = RichText()
@@ -3445,7 +3468,7 @@ class NexaPilotBot:
         events = res.get("tool_events") or []
         if events:
             r.line("")
-            for ev in events[:5]:
+            for ev in events[:8]:
                 r.line(
                     f"Tool {ev['tool']}: {'OK' if ev['ok'] else ev.get('status', 'DENIED')}",
                     icon="ai_task_done" if ev["ok"] else "lock",

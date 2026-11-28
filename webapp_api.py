@@ -1278,6 +1278,7 @@ class WebAppAgentConfigUpdateReq(BaseModel):
     perm_react: bool | None = None
     perm_control_server: bool | None = None
     perm_billing_actions: bool | None = None
+    perm_manage_account: bool | None = None
 
 
 class WebAppAgentChatReq(BaseModel):

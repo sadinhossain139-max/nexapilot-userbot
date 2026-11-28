@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -39,16 +40,13 @@ def load_proxy_nodes_from_env() -> list[ProxyNode]:
     nodes: list[ProxyNode] = []
     seen_urls: set[str] = set()
 
-    # 1. Numbered ENV pairs (1..10)
     for idx in range(1, 11):
         url = os.environ.get(f"AI_PROXY_{idx}_URL", "").strip().rstrip("/")
         key = os.environ.get(f"AI_PROXY_{idx}_KEY", "").strip() or default_key
-        if url:
-            if url not in seen_urls:
-                seen_urls.add(url)
-                nodes.append(ProxyNode(id=f"p{idx}", url=url, key=key))
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            nodes.append(ProxyNode(id=f"p{idx}", url=url, key=key))
 
-    # 2. Optional JSON array ENV
     raw_json = os.environ.get("AI_PROXIES_JSON", "").strip()
     if raw_json:
         try:
@@ -71,9 +69,11 @@ def load_proxy_nodes_from_env() -> list[ProxyNode]:
 
 class AIProxyPool:
     """
-    Multi-Server AI Proxy Load Balancer with Redis Round-Robin, Automatic Failover & Cooldown.
-    - Chat: POST {PROXY_URL}/chat/completions with header `x-proxy-key: {PROXY_KEY}`
-    - TTS:  POST {PROXY_URL}/tts with header `x-proxy-key: {PROXY_KEY}`
+    Strict Sequential Round-Robin AI Proxy Load Balancer (`1 -> 2 -> 3 -> ... -> N -> 1`).
+    - Every single /chat/completions and /tts call atomically increments `np:ai:rr_idx`
+      (or an asyncio.Lock-protected in-memory counter when Redis is unavailable).
+    - Tracks per-proxy `requests_served` telemetry in Redis (`np:ai:req_count:{proxy_id}`).
+    - Automatically marks failing proxies (429/5xx/timeout/network) in 60s cooldown and fails over.
     """
 
     def __init__(
@@ -87,8 +87,10 @@ class AIProxyPool:
         self.nodes: list[ProxyNode] = nodes if nodes is not None else load_proxy_nodes_from_env()
         self.timeout_seconds = timeout_seconds
         self.cooldown_seconds = cooldown_seconds
-        self._rr_mem_idx: int = 0
+        self._rr_lock = asyncio.Lock()
+        self._rr_mem_counter: int = 0
         self._mem_cooldowns: dict[str, float] = {}
+        self._mem_req_counts: dict[str, int] = {}
         self._http: httpx.AsyncClient | None = None
 
     @property
@@ -112,15 +114,18 @@ class AIProxyPool:
         self._http = None
 
     async def _next_start_index(self) -> int:
-        if not self.nodes:
+        """Atomically advance the global round-robin index (1 -> 2 -> ... -> N -> 1)."""
+        total = len(self.nodes)
+        if total <= 1:
             return 0
         if self.cache is not None and hasattr(self.cache, "next_ai_proxy_index"):
             idx = await self.cache.next_ai_proxy_index()
             if idx is not None:
-                return int(idx) % len(self.nodes)
-        idx = self._rr_mem_idx
-        self._rr_mem_idx = (self._rr_mem_idx + 1) % len(self.nodes)
-        return idx
+                return int(idx) % total
+        async with self._rr_lock:
+            idx = self._rr_mem_counter % total
+            self._rr_mem_counter += 1
+            return idx
 
     async def _is_in_cooldown(self, proxy_id: str) -> bool:
         exp = self._mem_cooldowns.get(proxy_id, 0.0)
@@ -141,11 +146,17 @@ class AIProxyPool:
         if self.cache is not None and hasattr(self.cache, "set_ai_proxy_cooldown"):
             await self.cache.set_ai_proxy_cooldown(proxy_id, self.cooldown_seconds)
 
+    async def _record_request_served(self, proxy_id: str) -> None:
+        self._mem_req_counts[proxy_id] = self._mem_req_counts.get(proxy_id, 0) + 1
+        if self.cache is not None and hasattr(self.cache, "incr_ai_proxy_req_count"):
+            await self.cache.incr_ai_proxy_req_count(proxy_id)
+
     async def _ordered_candidates(self) -> list[ProxyNode]:
-        if not self.nodes:
+        total = len(self.nodes)
+        if total == 0:
             return []
         start = await self._next_start_index()
-        rotated = self.nodes[start:] + self.nodes[:start]
+        rotated = [self.nodes[(start + offset) % total] for offset in range(total)]
         healthy: list[ProxyNode] = []
         cooling: list[ProxyNode] = []
         for node in rotated:
@@ -153,8 +164,30 @@ class AIProxyPool:
                 cooling.append(node)
             else:
                 healthy.append(node)
-        # Prefer healthy nodes; if every node is cooling down, still try them as last resort
         return healthy if healthy else cooling
+
+    async def get_proxy_stats(self) -> list[dict[str, Any]]:
+        """Return live health, cooldown state, and requests_served telemetry for Admin Overview."""
+        ids = [n.id for n in self.nodes]
+        redis_counts = (
+            await self.cache.get_ai_proxy_req_counts(ids)
+            if self.cache is not None and hasattr(self.cache, "get_ai_proxy_req_counts")
+            else {}
+        )
+        stats: list[dict[str, Any]] = []
+        for node in self.nodes:
+            in_cd = await self._is_in_cooldown(node.id)
+            served = max(int(redis_counts.get(node.id, 0)), int(self._mem_req_counts.get(node.id, 0)))
+            stats.append(
+                {
+                    "id": node.id,
+                    "url": node.url,
+                    "status": "cooldown" if in_cd else "healthy",
+                    "in_cooldown": in_cd,
+                    "requests_served": served,
+                }
+            )
+        return stats
 
     async def chat_completion(
         self,
@@ -164,7 +197,7 @@ class AIProxyPool:
         temperature: float = 0.4,
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
-        """Execute an OpenAI-compatible Chat Completion across healthy proxies with automatic failover."""
+        """Execute an OpenAI-compatible Chat Completion with strict sequential round-robin & failover."""
         if not self.nodes:
             raise AIProxyPoolError(
                 "No AI Proxy servers configured. Set AI_PROXY_1_URL / AI_PROXY_1_KEY in Environment Variables."
@@ -203,6 +236,7 @@ class AIProxyPool:
                     continue
                 data = resp.json()
                 if isinstance(data, dict) and data.get("choices"):
+                    await self._record_request_served(node.id)
                     return data
                 last_error = f"{node.id} returned empty choices"
                 await self._mark_cooldown(node.id, last_error)
@@ -222,7 +256,7 @@ class AIProxyPool:
         rate: str = "+0%",
         volume: str = "+0%",
     ) -> bytes:
-        """Generate MP3 speech bytes via proxy POST /tts with automatic failover."""
+        """Generate MP3 speech bytes via proxy POST /tts with strict round-robin & failover."""
         if not self.nodes:
             raise AIProxyPoolError("No AI Proxy servers configured for TTS.")
 
@@ -248,6 +282,7 @@ class AIProxyPool:
                     await self._mark_cooldown(node.id, last_error)
                     continue
                 if resp.content:
+                    await self._record_request_served(node.id)
                     return resp.content
                 last_error = f"{node.id} returned empty TTS audio"
             except (httpx.TimeoutException, httpx.TransportError) as exc:

@@ -148,20 +148,11 @@ class AdminBroadcastReq(BaseModel):
 
 
 async def _build_proxy_status_list(proxy_pool: Any) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
     if proxy_pool is None:
-        return items
-    for node in proxy_pool.nodes:
-        in_cd = await proxy_pool._is_in_cooldown(node.id)
-        items.append(
-            {
-                "id": node.id,
-                "url": node.url,
-                "status": "cooldown" if in_cd else "healthy",
-                "in_cooldown": in_cd,
-            }
-        )
-    return items
+        return []
+    if hasattr(proxy_pool, "get_proxy_stats"):
+        return await proxy_pool.get_proxy_stats()
+    return []
 
 
 @router.get("/overview")

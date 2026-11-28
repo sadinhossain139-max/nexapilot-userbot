@@ -2724,6 +2724,13 @@ class UserbotManager:
             if owner_id is None:
                 return
 
+            if self.cache is not None and hasattr(self.cache, "acquire_agent_dedup"):
+                got_lock = await self.cache.acquire_agent_dedup(
+                    int(owner_id), int(m.chat.id), int(m.id), ttl=120
+                )
+                if not got_lock:
+                    return
+
             sender_name = (
                 " ".join(
                     filter(
