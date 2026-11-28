@@ -54,15 +54,15 @@ TEXT_EMOJIS: dict[str, tuple[str, int]] = {
     "pending": ("🌐", int(os.environ.get("NEXA_EMOJI_PENDING", "5350361990374138712"))),          # VERIFIED
     "approved": ("✅", int(os.environ.get("NEXA_EMOJI_APPROVED", "5384611567125928766"))),        # VERIFIED
     "rejected": ("❌", int(os.environ.get("NEXA_EMOJI_REJECTED", "5904704361182798355"))),        # VERIFIED
-    # AI Agent Text Emojis (PLACEHOLDER — replace with dedicated IDs once provided)
-    "ai_agent": ("🤖", int(os.environ.get("NEXA_EMOJI_AI_AGENT", "6152062823523427051"))),        # PLACEHOLDER
-    "ai_brain": ("🧠", int(os.environ.get("NEXA_EMOJI_AI_BRAIN", "5353025608832004653"))),        # PLACEHOLDER
-    "ai_rules": ("📜", int(os.environ.get("NEXA_EMOJI_AI_RULES", "4949702513013031674"))),        # PLACEHOLDER
-    "ai_shield": ("🛡️", int(os.environ.get("NEXA_EMOJI_AI_SHIELD", "5422858869372104873"))),      # PLACEHOLDER
-    "ai_voice": ("🎙️", int(os.environ.get("NEXA_EMOJI_AI_VOICE", "5199885118214255386"))),        # PLACEHOLDER
-    "ai_react": ("✨", int(os.environ.get("NEXA_EMOJI_AI_REACT", "5787310874779717147"))),        # PLACEHOLDER
-    "ai_task_done": ("✅", int(os.environ.get("NEXA_EMOJI_AI_DONE", "5384611567125928766"))),     # PLACEHOLDER
-    "ai_log": ("📋", int(os.environ.get("NEXA_EMOJI_AI_LOG", "6001404325786556105"))),            # PLACEHOLDER
+    # AI Agent Text Emojis (VERIFIED)
+    "ai_agent": ("🤖", int(os.environ.get("NEXA_EMOJI_AI_AGENT", "5931614414351372818"))),        # VERIFIED
+    "ai_brain": ("🧠", int(os.environ.get("NEXA_EMOJI_AI_BRAIN", "5082546302449877858"))),        # VERIFIED
+    "ai_rules": ("📋", int(os.environ.get("NEXA_EMOJI_AI_RULES", "5449622283767258538"))),        # VERIFIED
+    "ai_shield": ("🛡", int(os.environ.get("NEXA_EMOJI_AI_SHIELD", "5776159202649051327"))),      # VERIFIED
+    "ai_voice": ("🔊", int(os.environ.get("NEXA_EMOJI_AI_VOICE", "5456579379167501171"))),        # VERIFIED
+    "ai_react": ("😀", int(os.environ.get("NEXA_EMOJI_AI_REACT", "5935824500208702046"))),        # VERIFIED
+    "ai_task_done": ("👍", int(os.environ.get("NEXA_EMOJI_AI_DONE", "5323547156630483403"))),     # VERIFIED
+    "ai_log": ("📋", int(os.environ.get("NEXA_EMOJI_AI_LOG", "5886223731088431288"))),            # VERIFIED
 }
 
 BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
@@ -128,15 +128,15 @@ BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
     "approve": ("❤️", int(os.environ.get("NEXA_BTN_APPROVE", "6258259403200270844"))),
     "reject": ("👎", int(os.environ.get("NEXA_BTN_REJECT", "6267000941547885720"))),
     "webapp": ("🤩", int(os.environ.get("NEXA_BTN_WEBAPP", "5353025608832004653"))),
-    # AI Agent Buttons (PLACEHOLDER — replace with dedicated IDs once provided)
-    "ai_agent": ("🤖", int(os.environ.get("NEXA_BTN_AI_AGENT", "6152062823523427051"))),
-    "ai_chat": ("💬", int(os.environ.get("NEXA_BTN_AI_CHAT", "5199885118214255386"))),
-    "ai_perms": ("🛡️", int(os.environ.get("NEXA_BTN_AI_PERMS", "5422858869372104873"))),
-    "ai_prompt": ("🧠", int(os.environ.get("NEXA_BTN_AI_PROMPT", "4949702513013031674"))),
-    "ai_logs": ("📋", int(os.environ.get("NEXA_BTN_AI_LOGS", "6001404325786556105"))),
-    "ai_perm_on": ("✅", int(os.environ.get("NEXA_BTN_AI_PERM_ON", "5323547156630483403"))),
-    "ai_perm_off": ("❌", int(os.environ.get("NEXA_BTN_AI_PERM_OFF", "5197396124536682206"))),
-    "ai_exit": ("🚪", int(os.environ.get("NEXA_BTN_AI_EXIT", "5422858869372104873"))),
+    # AI Agent Buttons (VERIFIED)
+    "ai_agent": ("🤖", int(os.environ.get("NEXA_BTN_AI_AGENT", "5255883984151276991"))),
+    "ai_chat": ("💬", int(os.environ.get("NEXA_BTN_AI_CHAT", "5767258028956978383"))),
+    "ai_perms": ("🔐", int(os.environ.get("NEXA_BTN_AI_PERMS", "5807952667992920776"))),
+    "ai_prompt": ("✍️", int(os.environ.get("NEXA_BTN_AI_PROMPT", "5350427505805238170"))),
+    "ai_logs": ("📋", int(os.environ.get("NEXA_BTN_AI_LOGS", "5886223731088431288"))),
+    "ai_perm_on": ("🟢", int(os.environ.get("NEXA_BTN_AI_PERM_ON", "5832572966721818453"))),
+    "ai_perm_off": ("🙅‍♂️", int(os.environ.get("NEXA_BTN_AI_PERM_OFF", "5924497670721769339"))),
+    "ai_exit": ("🕶️", int(os.environ.get("NEXA_BTN_AI_EXIT", "5467470746215292572"))),
 }
 
 
