@@ -119,6 +119,19 @@ def get_force_join_info() -> tuple[str | None, str | None]:
     return f"@{clean}", f"https://t.me/{clean}"
 
 
+MINI_APP_URL: str = _env_str("MINI_APP_URL", "")
+PUBLIC_BASE_URL: str = _env_str("PUBLIC_BASE_URL", "")
+
+
+def get_mini_app_url() -> str | None:
+    """Return the HTTPS URL for the NexaPilot Telegram Mini App, or None if not configured."""
+    if MINI_APP_URL:
+        return MINI_APP_URL.rstrip("/")
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL.rstrip('/')}/app"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Dynamic Payment Receiving Methods (Only displays ENV-configured methods)
 # ---------------------------------------------------------------------------

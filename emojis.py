@@ -118,6 +118,7 @@ BUTTON_EMOJIS: dict[str, tuple[str, int]] = {
     "submit_proof": ("➡️", int(os.environ.get("NEXA_BTN_SUBMIT_PROOF", "4956578755653927659"))),
     "approve": ("❤️", int(os.environ.get("NEXA_BTN_APPROVE", "6258259403200270844"))),
     "reject": ("👎", int(os.environ.get("NEXA_BTN_REJECT", "6267000941547885720"))),
+    "webapp": ("🤩", int(os.environ.get("NEXA_BTN_WEBAPP", "5353025608832004653"))),
 }
 
 
@@ -160,15 +161,18 @@ def make_button(
     emoji_key: str | None = None,
     style: str | None = None,
     url: str | None = None,
+    web_app: Any = None,
 ) -> InlineKeyboardButton:
     """
-    Build an InlineKeyboardButton (callback or URL) combining:
+    Build an InlineKeyboardButton (callback, URL, or WebAppInfo) combining:
     - Premium Custom Emoji icon (icon_custom_emoji_id) when supported (no Unicode duplicate)
     - Telegram colored button style ('success'=Green, 'primary'=Blue, 'danger'=Red)
     Gracefully falls back without crashing if either parameter is unsupported.
     """
     kwargs: dict[str, Any] = {}
-    if url is not None:
+    if web_app is not None:
+        kwargs["web_app"] = web_app
+    elif url is not None:
         kwargs["url"] = url
     elif callback_data is not None:
         kwargs["callback_data"] = callback_data

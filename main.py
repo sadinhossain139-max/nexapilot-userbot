@@ -18,7 +18,10 @@ except RuntimeError:
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pyrogram import Client
 from pyrogram.errors import (
@@ -43,6 +46,11 @@ from userbot import (
     SupabaseStore,
     UserbotManager,
     get_env_config,
+)
+from webapp_api import (
+    cleanup_webapp_logins,
+    configure_webapp_runtime,
+    router as webapp_router,
 )
 
 LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -141,6 +149,7 @@ async def cleanup_expired_pending_auths() -> None:
             logger.info("Cleaned up expired pending auth session %s.", sid)
     if nexapilot_bot is not None:
         await nexapilot_bot.cleanup_expired_logins()
+    await cleanup_webapp_logins()
 
 
 async def _get_valid_pending_auth(auth_session_id: str) -> PendingAuth:
@@ -271,12 +280,23 @@ async def lifespan(_app: FastAPI):
     else:
         logger.info("BOT_TOKEN not set; running userbot backend without NexaPilot bot.")
 
-    logger.info("NexaPilot Userbot Automation Server is ready (Kurigram + ftmgram + Redis).")
+    configure_webapp_runtime(
+        db=db_store,
+        cache=redis_cache,
+        manager=userbot_manager,
+        bot=nexapilot_bot,
+        api_id=config["api_id"],
+        api_hash=config["api_hash"],
+    )
+
+    logger.info("NexaPilot Userbot Automation Server is ready (Kurigram + ftmgram + Redis + Mini App).")
 
     try:
         yield
     finally:
         logger.info("Shutting down NexaPilot Userbot Automation Server...")
+        await cleanup_webapp_logins(force_all=True)
+
         if nexapilot_bot is not None:
             await nexapilot_bot.stop()
             nexapilot_bot = None
@@ -300,9 +320,23 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="NexaPilot — Telegram Userbot Automation Server",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
+
+# Mount NexaPilot Mini App API & static SPA (/app)
+app.include_router(webapp_router)
+
+WEBAPP_DIR = Path(__file__).resolve().parent / "webapp"
+
+
+@app.get("/app", include_in_schema=False)
+async def redirect_mini_app_slash() -> RedirectResponse:
+    return RedirectResponse(url="/app/")
+
+
+if WEBAPP_DIR.is_dir():
+    app.mount("/app", StaticFiles(directory=str(WEBAPP_DIR), html=True), name="nexapilot_webapp")
 
 
 # ---------------------------------------------------------------------------

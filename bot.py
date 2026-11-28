@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 import time
 import uuid
 from datetime import datetime
@@ -26,6 +27,7 @@ from ftmgram.types import (
     InlineKeyboardMarkup,
     Message as BotMessage,
     MessageEntity,
+    WebAppInfo,
 )
 
 # Kurigram is used strictly for temporary userbot auth/validation clients
@@ -55,6 +57,7 @@ from config import (
     REFERRALS_REQUIRED,
     get_configured_payment_methods,
     get_force_join_info,
+    get_mini_app_url,
     get_payment_method,
     get_plan_config,
 )
@@ -473,7 +476,20 @@ class NexaPilotBot:
             style="primary",
         )
 
-        return InlineKeyboardMarkup(
+        rows: list[list[InlineKeyboardButton]] = []
+        mini_url = get_mini_app_url()
+        if mini_url:
+            rows.append(
+                [
+                    make_button(
+                        "Open NexaPilot App",
+                        emoji_key="webapp",
+                        style="primary",
+                        web_app=WebAppInfo(url=mini_url),
+                    )
+                ]
+            )
+        rows.extend(
             [
                 [
                     make_button("My Account", "np:acc", "my_account", style="primary"),
@@ -496,6 +512,7 @@ class NexaPilotBot:
                 ],
             ]
         )
+        return InlineKeyboardMarkup(rows)
 
     def _cancel_kb(self, back: str = "np:home") -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -1228,7 +1245,8 @@ class NexaPilotBot:
             delivery = getattr(getattr(sent, "type", None), "name", "UNKNOWN")
             r = RichText()
             r.line(f"OTP Resent! Delivery: {delivery}", icon="ok")
-            r.line("Send the OTP code you received:")
+            r.line("IMPORTANT: Send the OTP with SPACES between digits (e.g. 1 2 3 4 5 or 12 345).", icon="warn")
+            r.line("Spaces prevent Telegram's anti-code-sharing filter from blocking your login code.")
             await self.edit_ui(cq, r, self._cancel_kb("np:acc"))
         except Exception as exc:
             r = RichText().line(f"Resend failed: {exc}", icon="err")
@@ -2192,7 +2210,8 @@ class NexaPilotBot:
         delivery = getattr(getattr(sent, "type", None), "name", "APP")
         r = RichText()
         r.line(f"OTP Sent! (Delivery: {delivery})", icon="ok")
-        r.line("Enter the OTP code you received (e.g. 12345):")
+        r.line("IMPORTANT: Send the OTP with SPACES between digits (e.g. 1 2 3 4 5 or 12 345).", icon="warn")
+        r.line("Spaces prevent Telegram's anti-code-sharing algorithm from blocking your login code.")
         kb = InlineKeyboardMarkup(
             [
                 [make_button("Resend Code", "np:acc:resend", "resend", style="primary")],
@@ -2240,7 +2259,7 @@ class NexaPilotBot:
                 self._main_menu_kb(),
             )
             return
-        code = raw_code.replace("-", "").replace(" ", "")
+        code = re.sub(r"[\s\-]+", "", raw_code)
         try:
             await entry["client"].sign_in(entry["phone"], entry["hash"], code)
         except SessionPasswordNeeded:

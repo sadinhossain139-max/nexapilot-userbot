@@ -1182,6 +1182,19 @@ class SupabaseStore:
         )
         return res.data[0] if res.data else None
 
+    async def list_user_payment_requests(
+        self, user_id: int, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        res = await self._run(
+            lambda: self._client.table("payment_requests")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+
 
 # ---------------------------------------------------------------------------
 # Pyrogram / Kurigram In-Memory Userbot Manager

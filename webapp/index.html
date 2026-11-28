@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>NexaPilot — Automation Control Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <main class="app-shell">
+    <header class="top-bar">
+      <div class="brand">
+        <span id="brand-logo"></span>
+        <div>
+          <div class="brand-title">NexaPilot</div>
+          <div id="brand-sub" class="brand-sub">Automation Control Center</div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button id="btn-top-refresh" class="btn btn-ghost btn-icon" type="button" title="Refresh" aria-label="Refresh"></button>
+      </div>
+    </header>
+
+    <div id="app-root">
+      <div class="skeleton" style="height: 140px; margin-bottom: 14px;"></div>
+      <div class="kpi-grid">
+        <div class="skeleton" style="height: 92px;"></div>
+        <div class="skeleton" style="height: 92px;"></div>
+        <div class="skeleton" style="height: 92px;"></div>
+        <div class="skeleton" style="height: 92px;"></div>
+      </div>
+      <div class="skeleton" style="height: 120px;"></div>
+    </div>
+  </main>
+
+  <nav id="bottom-nav" class="bottom-nav hidden" aria-label="Primary Navigation">
+    <div class="bottom-nav-inner" id="bottom-nav-inner"></div>
+  </nav>
+
+  <div id="sheet-backdrop" class="sheet-backdrop" role="dialog" aria-modal="true">
+    <div class="sheet" id="sheet-panel">
+      <div class="sheet-handle"></div>
+      <div class="sheet-head">
+        <h3 class="sheet-title" id="sheet-title">Modal</h3>
+        <button id="sheet-close" class="btn btn-ghost btn-icon" type="button" aria-label="Close"></button>
+      </div>
+      <div id="sheet-body"></div>
+    </div>
+  </div>
+
+  <script src="./icons.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
